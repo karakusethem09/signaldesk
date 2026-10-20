@@ -1,0 +1,5 @@
+# Only used to configure pytest, so that a plain `pytest` run from the project root works.
+[tool.pytest.ini_options]
+# Put the project root on the import path so tests can do `from signaldesk import data`.
+pythonpath = ["."]
+testpaths = ["tests"]

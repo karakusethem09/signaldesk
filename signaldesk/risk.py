@@ -1,0 +1,830 @@
+"""SignalDesk math layer: returns, volatility, correlation, drawdown, VaR and Sharpe.
+
+Every function here is a plain, pure function. It takes a pandas table, returns a number
+or a table, and does nothing else: no downloading, no plotting, no printing. The same
+input always gives the same output, and the input is never modified. The dashboard
+(Phase 1) and the agents (Phase 2) both call these functions, so none of the math lives
+anywhere else.
+
+Shapes: every function accepts either a pandas Series (one ticker) or a DataFrame (one
+column per ticker, like the table from ``data.load_prices``).
+    - scalar metrics (volatility, VaR, Sharpe, ...): Series in -> float out,
+      DataFrame in -> a Series out, indexed by ticker
+    - time series (returns, cumulative growth, rolling volatility): Series in -> Series
+      out, DataFrame in -> DataFrame out
+
+Units: everything is a FRACTION, not a percent. 0.25 means 25%.
+
+Conventions (each one is repeated in the docstring of the functions it affects)
+    - Returns are SIMPLE daily returns: ``P_t / P_(t-1) - 1``.
+    - A year has 252 trading days (``TRADING_DAYS_PER_YEAR``). Volatility, Sharpe and the
+      annualized return all use that same number. Designed for exchange-traded
+      stocks/ETFs (252 trading days a year). Assets that trade 7 days a week (e.g.
+      crypto) will be annualized incorrectly: for example BTC in 2024 returned +111.5%,
+      but the annualized return shown here would be 67.7%. There is no weekend detection.
+    - Losses are POSITIVE numbers. ``historical_var`` and ``max_drawdown`` both return
+      0.25 for "a 25% loss". Do not expect a minus sign.
+    - Prices are expected to be ADJUSTED closes (already corrected for splits and
+      dividends, which is what ``data.load_prices`` gives). We never adjust them again.
+
+Missing values (gaps)
+    The data layer never fills gaps: a missing price stays NaN. We keep that policy and
+    measure every ticker against ITSELF, so a ticker's numbers never depend on which
+    other tickers share the table:
+    - ``daily_returns`` compares each price with that ticker's own previous VALID price.
+      A row where the price is NaN gets a NaN return, and the next valid price is
+      measured against the last valid one. [100, NaN, 110] gives returns [NaN, 0.10].
+      A return that skips over one or more NaN rows is called a BRIDGED return. It
+      covers more than one trading day but counts as one observation. This is normal
+      for exchange holidays (a US holiday is a NaN row for AAPL when the table also holds
+      Tokyo and Frankfurt stocks), and otherwise it means missing data. One
+      ``GapWarning`` per call names the tickers, the number of bridged returns and the
+      LONGEST bridge in rows (a holiday is 1 row, an outage can be 40). A bridge longer than
+      ``MAX_HOLIDAY_GAP_ROWS`` (5) rows adds a stronger sentence: that is longer than any
+      holiday, so it is probably missing data.
+      Leading NaNs (a late start) and trailing NaNs are not bridges: there is no earlier
+      or later price to span.
+    - The statistics (volatility, VaR, Sharpe, annualized return) drop the NaN returns of
+      each column separately and use that column's own count of valid returns.
+    - Rolling volatility works on each ticker's own valid returns too, so a holiday row
+      does not blank out the next ``window`` days.
+    - ``cumulative_returns`` and ``max_drawdown`` look at price LEVELS and simply skip
+      NaN prices. Everything therefore agrees: the annualized return of a ticker is
+      exactly ``P_last_valid / P_first_valid`` annualized over that ticker's own number
+      of returns, which is also the last valid value of ``cumulative_returns``.
+
+Sample size
+    Statistics from a few days of data are nearly meaningless, but the numbers still
+    come out looking precise. So:
+    - fewer than 2 valid data points in a column raises ``ValueError`` (a standard
+      deviation needs at least 2 points);
+    - fewer than ``MIN_RELIABLE_OBS`` (60, about 3 months of trading days) valid
+      observations emits a ``ShortSampleWarning`` naming the column and the count. It is
+      a warning, not an error, because the number is still returned.
+    The Phase 2 risk agent reads these warnings (and ``GapWarning``) to decide whether a
+    claim rests on a long enough, gap-free sample.
+
+Prices versus returns
+    The functions that take returns refuse input that looks like prices (a column whose
+    median absolute value is above 0.5) with a ValueError: volatility of a price series
+    is a number, but it means nothing. Call ``daily_returns`` first.
+    This is only a HEURISTIC for typical stock prices (tens or hundreds of dollars). It
+    cannot catch a price series that stays below about 0.5 (penny stocks, some crypto
+    tokens), and the same price series would be mistaken for returns there.
+"""
+
+from __future__ import annotations
+
+import math
+import numbers
+import warnings
+
+import numpy as np
+import pandas as pd
+
+__all__ = [
+    "MIN_RELIABLE_OBS",
+    "MAX_HOLIDAY_GAP_ROWS",
+    "MIN_RELIABLE_WINDOW",
+    "MIN_TAIL_OBS",
+    "TRADING_DAYS_PER_YEAR",
+    "GapWarning",
+    "ShortSampleWarning",
+    "SkippedTickerWarning",
+    "annualized_return",
+    "annualized_volatility",
+    "correlation_matrix",
+    "cumulative_returns",
+    "daily_returns",
+    "historical_var",
+    "max_drawdown",
+    "risk_summary",
+    "sharpe_ratio",
+]
+
+# --------------------------------------------------------------------------- #
+# Constants and the warning class
+# --------------------------------------------------------------------------- #
+
+#: Number of trading days in a year, used to annualize (volatility, Sharpe, CAGR).
+TRADING_DAYS_PER_YEAR = 252
+
+#: Fewer valid observations than this and a statistic gets a ShortSampleWarning.
+#: 60 trading days is roughly 3 months.
+MIN_RELIABLE_OBS = 60
+
+#: A rolling window shorter than this gets a ShortSampleWarning (too noisy).
+MIN_RELIABLE_WINDOW = 20
+
+#: Historical VaR needs at least this many observations in the loss tail.
+MIN_TAIL_OBS = 5
+
+#: A bridged return that skips more NaN rows than this is longer than any exchange holiday,
+#: so ``GapWarning`` calls it probably missing data.
+MAX_HOLIDAY_GAP_ROWS = 5
+
+# A standard deviation below this counts as "zero". The standard deviation of a column
+# of identical numbers is not always exactly 0.0 in floating point (it can be ~1e-17),
+# and dividing by that would give a huge nonsense Sharpe ratio.
+_ZERO_STD = 1e-12
+
+_SQRT_TRADING_DAYS = math.sqrt(TRADING_DAYS_PER_YEAR)
+
+
+class ShortSampleWarning(UserWarning):
+    """Emitted when a number is based on too few observations to be trusted.
+
+    It is only a warning: the number is still returned. Catch it (``pytest.warns`` or
+    ``warnings.catch_warnings``) to find out which result is shaky.
+    """
+
+
+class GapWarning(UserWarning):
+    """Emitted by ``daily_returns`` when some returns span missing prices ("bridged" returns).
+
+    Normal for exchange holidays when tickers from different exchanges share a table;
+    otherwise it means missing data (see ``data.find_gaps``). The message gives each
+    ticker's number of bridged returns and its longest bridge in rows, and warns more
+    strongly when a bridge is longer than ``MAX_HOLIDAY_GAP_ROWS``. The numbers are still
+    returned.
+    """
+
+
+class SkippedTickerWarning(UserWarning):
+    """Emitted by ``risk_summary`` when a ticker could not be calculated and got a NaN row.
+
+    The message names the ticker and the reason (for example "only 1 valid return").
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Small private helpers
+# --------------------------------------------------------------------------- #
+
+def _prepare(
+    data,
+    what: str,
+    *,
+    ordered: bool = False,
+    positive: bool = False,
+    expect_returns: bool = False,
+) -> tuple[pd.DataFrame, bool]:
+    """Check the input and return ``(frame, is_series)``.
+
+    ``frame`` is always a NEW float64 DataFrame (so the caller's data is never touched),
+    even if a Series was given (it becomes a one-column frame). ``is_series`` tells the
+    caller to turn the result back into a Series / float at the end.
+
+    Raises ValueError for: not a pandas object, no rows or columns, duplicate column
+    names, non-numeric columns, infinite values, and (when asked) an index that is not
+    in increasing order, prices that are zero or negative, or a column that looks like
+    prices when returns are expected. NaN is allowed: it means "gap".
+    """
+    if isinstance(data, pd.Series):
+        is_series = True
+        frame = data.to_frame(name="series" if data.name is None else data.name)
+    elif isinstance(data, pd.DataFrame):
+        is_series = False
+        frame = data
+    else:
+        raise ValueError(f"{what} must be a pandas Series or DataFrame, got {type(data).__name__}.")
+
+    if frame.shape[0] == 0 or frame.shape[1] == 0:
+        raise ValueError(f"{what} is empty (it has no rows or no columns), so there is nothing to calculate.")
+    if frame.columns.has_duplicates:
+        raise ValueError(f"{what} has duplicate column names; every ticker must appear once.")
+    for label, dtype in frame.dtypes.items():
+        # Floats and integers only: this also rejects bool, text, dates and complex numbers.
+        if not (pd.api.types.is_float_dtype(dtype) or pd.api.types.is_integer_dtype(dtype)):
+            raise ValueError(f"{what}: column {label!r} is not numeric (its dtype is {dtype}).")
+
+    frame = frame.astype("float64")  # always a copy
+    values = frame.to_numpy()
+    infinite = np.isinf(values).any(axis=0)
+    if infinite.any():
+        bad = ", ".join(repr(c) for c in frame.columns[infinite])
+        raise ValueError(f"{what}: infinite values found in {bad}. Check the data for a zero price.")
+    if expect_returns:
+        # Real daily returns have a median absolute value around 0.01 (and rarely exceed
+        # 0.2). A median above 0.5 means the column is almost certainly a price series,
+        # whose "volatility" or "VaR" would be a meaningless number.
+        # This is only a HEURISTIC for typical stock prices (tens or hundreds of dollars):
+        # a price series that stays below about 0.5 (penny stocks, some crypto tokens)
+        # passes unnoticed. The MEDIAN is used so that one huge day (a +400% squeeze) in
+        # an otherwise normal series does not trigger it.
+        typical = frame.abs().median()  # per column, ignoring NaN
+        prices_like = typical > 0.5
+        if prices_like.any():
+            bad = ", ".join(repr(c) for c in typical.index[prices_like])
+            raise ValueError(
+                f"{what}: {bad} looks like prices, not returns; call daily_returns first "
+                f"(its median absolute value is above 0.5, but daily returns are usually "
+                "around 0.01)."
+            )
+    if positive and (values <= 0).any():
+        bad = ", ".join(repr(c) for c in frame.columns[(values <= 0).any(axis=0)])
+        raise ValueError(f"{what}: prices must be greater than 0, but {bad} has zero or negative prices.")
+    if ordered and not (frame.index.is_monotonic_increasing and frame.index.is_unique):
+        raise ValueError(
+            f"{what}: the index must be in increasing order with no repeated dates "
+            "(oldest first), because the calculation depends on the order."
+        )
+    return frame, is_series
+
+
+def _require_obs(frame: pd.DataFrame, caller: str, unit: str) -> pd.Series:
+    """Raise ValueError if any column has fewer than 2 valid (non-NaN) values.
+
+    Returns the count of valid values per column (used for the short-sample warnings).
+    ``unit`` is "prices" or "returns", only used in the message.
+    """
+    counts = frame.count()
+    too_few = counts[counts < 2]
+    if not too_few.empty:
+        detail = ", ".join(f"{label!r} has {n}" for label, n in too_few.items())
+        raise ValueError(f"{caller}: need at least 2 valid {unit} per column, but {detail}.")
+    return counts
+
+
+def _bridge_stats(frame: pd.DataFrame) -> pd.DataFrame:
+    """Per column: how many returns are bridged and how long the longest bridge is.
+
+    A bridged return is one on a valid row whose previous row(s) are NaN while the column
+    has an earlier valid price to measure against. Its length is the number of NaN rows it
+    skips. Leading NaNs (no earlier price) and trailing NaNs (no return at all) are not
+    bridges. Returns a table indexed like the columns, with the columns ``bridged`` (count)
+    and ``longest`` (rows; 0 when there are no bridges).
+    """
+    bridged, longest = [], []
+    for i in range(frame.shape[1]):
+        valid_rows = np.flatnonzero(frame.iloc[:, i].notna().to_numpy())
+        skipped = np.diff(valid_rows) - 1  # NaN rows between each pair of consecutive valid prices
+        skipped = skipped[skipped > 0]
+        bridged.append(len(skipped))
+        longest.append(int(skipped.max()) if len(skipped) else 0)
+    return pd.DataFrame({"bridged": bridged, "longest": longest}, index=frame.columns, dtype="int64")
+
+
+def _rows(n: int) -> str:
+    return f"{n} row" if n == 1 else f"{n} rows"
+
+
+def _warn_gaps(caller: str, stats: pd.DataFrame) -> None:
+    """Emit ONE GapWarning listing every column that has bridged returns. Same ``stacklevel`` rule.
+
+    Each ticker is shown as ``'AAPL': 19 bridged (longest 1 row)``. If any longest bridge
+    is above ``MAX_HOLIDAY_GAP_ROWS``, a stronger sentence names those tickers and says it is
+    longer than a holiday.
+    """
+    with_bridges = stats[stats["bridged"] > 0]
+    if with_bridges.empty:
+        return
+    detail = ", ".join(
+        f"{label!r}: {row.bridged} bridged (longest {_rows(row.longest)})" for label, row in with_bridges.iterrows()
+    )
+    message = (
+        f"{caller}: some returns span missing prices ({detail}). Each one is measured against "
+        "that ticker's own previous valid price, so it covers more than one trading day but "
+        "counts as one observation. Short bridges (a few rows) are normal for exchange "
+        "holidays when tickers from different exchanges share a table; otherwise it means "
+        "missing data (see data.find_gaps)."
+    )
+    long_ones = with_bridges[with_bridges["longest"] > MAX_HOLIDAY_GAP_ROWS]
+    if not long_ones.empty:
+        long_detail = ", ".join(f"{label!r} ({_rows(row.longest)})" for label, row in long_ones.iterrows())
+        message += (
+            f" A gap of more than {MAX_HOLIDAY_GAP_ROWS} rows is longer than a holiday: {long_detail}. "
+            "This is likely missing data, and the returns across it are multi-week moves "
+            "counted as one day."
+        )
+    warnings.warn(message, GapWarning, stacklevel=3)
+
+
+def _warn_short_sample(caller: str, counts: pd.Series, unit: str = "observations") -> None:
+    """Emit ONE ShortSampleWarning listing every column with fewer than MIN_RELIABLE_OBS.
+
+    Call it directly from a public function: ``stacklevel=3`` makes the warning point at
+    the line that called that public function.
+    """
+    short = counts[counts < MIN_RELIABLE_OBS]
+    if short.empty:
+        return
+    detail = ", ".join(f"{label!r}: {n}" for label, n in short.items())
+    warnings.warn(
+        f"{caller}: fewer than {MIN_RELIABLE_OBS} valid {unit} (about 3 months of trading "
+        f"days) for {detail}. The result is based on a short sample and may not be reliable.",
+        ShortSampleWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_thin_tail(caller: str, counts: pd.Series, confidence: float) -> None:
+    """Emit ONE ShortSampleWarning for columns with fewer than MIN_TAIL_OBS tail observations.
+
+    The tail is the worst ``(1 - confidence)`` share of days. Same ``stacklevel`` rule as
+    ``_warn_short_sample``.
+    """
+    tails = counts * (1.0 - confidence)
+    # The small tolerance stops float noise from warning at the exact boundary
+    # (for example 50 * (1 - 0.9) is 4.999999999999999, but it means exactly 5).
+    thin = tails[tails < MIN_TAIL_OBS - 1e-9]
+    if thin.empty:
+        return
+    detail = ", ".join(f"{label!r}: n={counts[label]}, about {tails[label]:.1f} in the tail" for label in thin.index)
+    warnings.warn(
+        f"{caller}: too few observations in the loss tail at confidence={confidence:g} "
+        f"({detail}). Historical VaR needs at least {MIN_TAIL_OBS} observations in the tail "
+        f"(n * (1 - confidence) >= {MIN_TAIL_OBS}), so this estimate rests on very few days.",
+        ShortSampleWarning,
+        stacklevel=3,
+    )
+
+
+def _real_number(value, name: str) -> float:
+    """Return ``value`` as a float, or raise ValueError if it is not a finite real number.
+
+    ``True``/``False`` are rejected on purpose: they are ints in Python, but passing one
+    here is almost certainly a mistake.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}.")
+    return float(value)
+
+
+def _check_confidence(confidence) -> float:
+    """Validate a VaR confidence level: a number strictly between 0 and 1."""
+    level = _real_number(confidence, "confidence")
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"confidence must be strictly between 0 and 1 (for example 0.95), got {confidence!r}.")
+    return level
+
+
+def _finish_scalar(result: pd.Series, is_series: bool):
+    """Per-column results -> a float for a Series input, or the Series (by ticker) for a DataFrame.
+
+    The returned Series has no name: pandas would otherwise leave an accidental one behind
+    (``DataFrame.quantile`` names its result after the quantile, for example).
+    """
+    if is_series:
+        return float(result.iloc[0])
+    result.name = None
+    return result
+
+
+def _finish_series(result: pd.DataFrame, original, is_series: bool):
+    """Time-series results -> a Series (same name as the input) for a Series input, else the DataFrame."""
+    return result.iloc[:, 0].rename(original.name) if is_series else result
+
+
+# --------------------------------------------------------------------------- #
+# Public functions
+# --------------------------------------------------------------------------- #
+
+def daily_returns(prices):
+    """Simple daily returns: how much the price changed since the ticker's previous price.
+
+    Formula: ``r_t = P_t / P_prev - 1``, where ``P_prev`` is that ticker's own previous
+    VALID (non-NaN) price. Units: a fraction (0.10 = +10%).
+    Example: prices [100, 110, 99] give returns [0.10, -0.10].
+
+    The first row has no previous price, so it is dropped: the result has one row fewer
+    than the input and keeps the dates of the remaining rows.
+
+    Gaps: each column is measured against itself, never against other tickers.
+    - A row where the price is NaN gets a NaN return.
+    - The next valid price is measured against the last valid one: [100, NaN, 110] gives
+      [NaN, 0.10]. That return skips a missing row, so it is called BRIDGED: it covers
+      more than one trading day but counts as one observation.
+    - The first valid price of a late starter has no return (nothing before it), and
+      trailing NaNs just give NaN. Neither is a bridge.
+    Nothing is ever filled in or invented. If any column has bridged returns, ONE
+    ``GapWarning`` is emitted naming each ticker and how many returns were bridged. That is
+    normal for exchange holidays when tickers from different exchanges share a table, and
+    otherwise means missing data (see ``data.find_gaps``). The numbers are still returned.
+
+    Why this policy: a ticker's returns, and every statistic built on them, then do not
+    depend on which other tickers happen to be in the table, and they agree with
+    ``cumulative_returns`` (the compounded returns equal the price growth).
+
+    Input: adjusted close prices, oldest first, all greater than 0. Needs at least 2
+    valid prices per column, otherwise ValueError (naming the column). It does not warn
+    about sample size: it only reshapes the data, it does not estimate anything.
+    """
+    frame, is_series = _prepare(prices, "prices", ordered=True, positive=True)
+    _require_obs(frame, "daily_returns", "prices")
+    # frame.ffill().shift(1) is, on every row, the last valid price BEFORE that row (per
+    # column). The ffill is used only to look that price up; it is never put in the result.
+    # On a row whose own price is NaN the division gives NaN, so no value is invented.
+    previous_valid = frame.ffill().shift(1)
+    returns = (frame / previous_valid - 1.0).iloc[1:]
+    _warn_gaps("daily_returns", _bridge_stats(frame))
+    return _finish_series(returns, prices, is_series)
+
+
+def cumulative_returns(prices):
+    """Growth of 1 unit invested at the start: how many times the first price the price is now.
+
+    Formula: ``G_t = P_t / P_first``, where ``P_first`` is the first valid (non-NaN)
+    price of that column. So every column starts at 1.0 (1.10 means +10% since the
+    start, 0.80 means -20%). Units: a multiple, not a percent.
+
+    The result has the same dates as the input. It is NaN where the price is NaN and
+    before a column's first valid price (a ticker that starts later starts at 1.0 on its
+    own first day).
+
+    Gaps: NaN prices are skipped (this works on price levels). That is consistent with
+    ``daily_returns``: the compounded returns of a ticker equal its last valid value here,
+    ``P_last_valid / P_first_valid``.
+
+    Needs at least 2 valid prices per column, otherwise ValueError. No sample-size warning
+    (it is a path, not an estimate).
+    """
+    frame, is_series = _prepare(prices, "prices", ordered=True, positive=True)
+    _require_obs(frame, "cumulative_returns", "prices")
+    first_valid = pd.Series(
+        [frame.iloc[:, i].dropna().iloc[0] for i in range(frame.shape[1])],
+        index=frame.columns,
+        dtype="float64",
+    )
+    return _finish_series(frame / first_valid, prices, is_series)
+
+
+def annualized_return(returns, *, _skip_prices_check=False):
+    """Annualized return, the geometric way (also called CAGR): the steady yearly growth rate.
+
+    Formula: ``(prod(1 + r)) ** (252 / n) - 1`` where ``n`` is the number of valid
+    returns of that column. In words: compound all the daily returns, then scale that
+    growth to a 252-day year. Units: a fraction per year (0.12 = +12% a year).
+
+    This is GEOMETRIC. It is not the arithmetic mean times 252 (which ``sharpe_ratio``
+    uses). The two differ whenever returns vary: returns [+10%, -10%] have an arithmetic
+    mean of 0, but the money actually shrank (1.1 * 0.9 = 0.99).
+
+    Gaps: NaN returns are dropped per column, and ``n`` counts only the valid ones. Fed
+    with ``daily_returns``, the result is exactly ``(P_last_valid / P_first_valid)`` raised
+    to ``252 / n``, minus 1, for that ticker's own prices.
+    Needs at least 2 valid returns per column and no return below -1 (-100%), otherwise
+    ValueError. Prices passed by mistake (median absolute value above 0.5, a heuristic for
+    typical stock prices) are refused too. Warns (ShortSampleWarning) below
+    ``MIN_RELIABLE_OBS`` valid returns: stretching a few days to a full year makes the
+    number wildly sensitive.
+
+    (``_skip_prices_check`` is private, used only by ``risk_summary``, which knows its
+    input really is returns. Do not pass it.)
+    """
+    frame, is_series = _prepare(returns, "returns", expect_returns=not _skip_prices_check)
+    counts = _require_obs(frame, "annualized_return", "returns")
+    below = (frame < -1.0).any()
+    if below.any():
+        bad = ", ".join(repr(c) for c in below[below].index)
+        raise ValueError(f"annualized_return: a return below -1 (-100%) is impossible, found in {bad}.")
+    _warn_short_sample("annualized_return", counts, "returns")
+    # prod(1 + r) written as exp(sum(log(1 + r))) so a long series cannot overflow.
+    # A return of exactly -1 gives log(0) = -inf and exp(-inf) = 0, so the result is -1
+    # (a total loss), which is correct; the divide-by-zero notice is expected there.
+    with np.errstate(divide="ignore"):
+        log_growth = np.log1p(frame).sum()  # sum skips NaN
+    result = np.expm1(TRADING_DAYS_PER_YEAR / counts * log_growth)
+    return _finish_scalar(result, is_series)
+
+
+def annualized_volatility(returns, window=None, *, _skip_prices_check=False):
+    """Annualized volatility: how much returns jump around, scaled to one year.
+
+    Formula: ``std(r, ddof=1) * sqrt(252)``. The standard deviation uses the SAMPLE
+    formula (divide by n - 1, not n). Multiplying by sqrt(252) turns a daily number into
+    a yearly one (volatility grows with the square root of time). Units: a fraction
+    per year (0.28 = 28% a year).
+
+    Without ``window``: one number per column from all its valid returns.
+
+    With ``window`` (an int, at least 2): a ROLLING series, computed on each ticker's own
+    valid returns. The value on date t is the std of that ticker's last ``window`` valid
+    returns up to and including t (the window trails behind, it never looks ahead), so a
+    ticker's first ``window - 1`` valid returns give NaN. Dates where the return itself is
+    NaN (a holiday) give NaN, but they do not blank out the following days: the window
+    just skips over them. The result has the same shape and dates as ``returns``.
+    ``window`` must not be longer than the number of rows. A ``window`` below
+    ``MIN_RELIABLE_WINDOW`` (20) is allowed but warns, because a std from so few
+    points is very noisy. The rolling form does not warn per point.
+
+    Needs at least 2 valid returns per column, otherwise ValueError. Prices passed by
+    mistake (median absolute value above 0.5, a heuristic for typical stock prices) are
+    refused too. Without ``window`` it warns (ShortSampleWarning) below
+    ``MIN_RELIABLE_OBS`` valid returns.
+
+    (``_skip_prices_check`` is private, used only by ``risk_summary``. Do not pass it.)
+    """
+    if window is not None:
+        if isinstance(window, bool) or not isinstance(window, numbers.Integral) or window < 2:
+            raise ValueError(f"window must be a whole number of at least 2, got {window!r}.")
+        window = int(window)
+
+    frame, is_series = _prepare(returns, "returns", ordered=window is not None, expect_returns=not _skip_prices_check)
+    counts = _require_obs(frame, "annualized_volatility", "returns")
+
+    if window is None:
+        _warn_short_sample("annualized_volatility", counts, "returns")
+        return _finish_scalar(frame.std(ddof=1) * _SQRT_TRADING_DAYS, is_series)
+
+    if window > len(frame):
+        raise ValueError(
+            f"annualized_volatility: window={window} is longer than the {len(frame)} rows "
+            "given, so not a single full window exists."
+        )
+    if window < MIN_RELIABLE_WINDOW:
+        warnings.warn(
+            f"annualized_volatility: window={window} is shorter than {MIN_RELIABLE_WINDOW} "
+            "observations, so every rolling value is a very noisy estimate.",
+            ShortSampleWarning,
+            stacklevel=2,
+        )
+    # Per ticker, on its own valid returns only (dropna), so one ticker's holidays never
+    # affect another ticker, and a NaN does not blank out the next `window` days.
+    # Trailing window (the pandas default, center=False): the value at a return sees only
+    # that return and the ones before it. min_periods=window: a FULL window is needed.
+    # reindex puts the values back on the original dates (NaN on the dates with no return).
+    parts = []
+    for i in range(frame.shape[1]):
+        valid = frame.iloc[:, i].dropna()
+        parts.append(valid.rolling(window, min_periods=window).std(ddof=1).reindex(frame.index))
+    rolling = pd.concat(parts, axis=1)
+    rolling.columns = frame.columns
+    return _finish_series(rolling * _SQRT_TRADING_DAYS, returns, is_series)
+
+
+def correlation_matrix(returns):
+    """Pearson correlation between the tickers' returns: do they move together?
+
+    Formula: ``corr(a, b) = cov(a, b) / (std(a) * std(b))`` for every pair of columns.
+    Units: a number from -1 (opposite moves) through 0 (unrelated) to +1 (same moves).
+    The result is a square DataFrame (tickers x tickers) and symmetric. The diagonal is
+    1.0, except for a zero-variance column (see below), whose diagonal is NaN too.
+
+    Needs a DataFrame with at least 2 columns (a Series or a single column raises
+    ValueError, a correlation needs two things) and at least 2 valid returns per column.
+
+    Gaps: NaN is handled PAIRWISE (pandas default). Each cell uses only the dates on
+    which BOTH of its tickers have a return, so different cells can rest on different
+    numbers of days. A pair with fewer than 2 shared dates gives NaN. A column whose
+    returns are all identical (zero variance) has an undefined correlation: NaN, in its
+    whole row and column including the diagonal.
+    Warns (ShortSampleWarning, one warning listing the pairs) if any pair shares fewer
+    than ``MIN_RELIABLE_OBS`` dates.
+    """
+    frame, is_series = _prepare(returns, "returns", expect_returns=True)
+    if is_series or frame.shape[1] < 2:
+        raise ValueError(
+            "correlation_matrix needs a DataFrame with at least 2 columns (tickers), "
+            f"got {'a Series' if is_series else 'only one column'}."
+        )
+    _require_obs(frame, "correlation_matrix", "returns")
+
+    valid = frame.notna().to_numpy().astype(int)
+    shared = valid.T @ valid  # shared[i, j] = number of dates where both i and j have a return
+    short_pairs = [
+        (frame.columns[i], frame.columns[j], int(shared[i, j]))
+        for i in range(frame.shape[1])
+        for j in range(i + 1, frame.shape[1])
+        if shared[i, j] < MIN_RELIABLE_OBS
+    ]
+    if short_pairs:
+        detail = ", ".join(f"{a!r}/{b!r}: {n}" for a, b, n in short_pairs)
+        warnings.warn(
+            f"correlation_matrix: fewer than {MIN_RELIABLE_OBS} shared valid returns "
+            f"(about 3 months of trading days) for {detail}. These correlations are based "
+            "on a short sample and may not be reliable.",
+            ShortSampleWarning,
+            stacklevel=2,
+        )
+    return frame.corr(method="pearson", min_periods=2)
+
+
+def max_drawdown(prices):
+    """Maximum drawdown: the biggest fall from a previous high to a later low.
+
+    Formula: ``max over t of (1 - P_t / running_max(P)_t)``, where ``running_max`` is the
+    highest price seen UP TO that day (not over the whole series). Equivalently it is
+    ``-min(P_t / running_max_t - 1)``.
+
+    SIGN: returned as a POSITIVE fraction. 0.25 means "at some point the price was 25%
+    below its earlier peak". This matches ``historical_var``, which also returns losses
+    as positive numbers. It returns 0.0 for a series that never falls below an earlier
+    price.
+
+    Units: a fraction between 0 and 1.
+
+    Gaps: NaN prices are skipped (this works on price levels, like ``cumulative_returns``,
+    so it agrees with ``daily_returns``). Needs at least 2 valid prices per column, otherwise ValueError.
+    Warns (ShortSampleWarning) below ``MIN_RELIABLE_OBS`` valid prices: a short window
+    cannot have seen a real drawdown.
+    """
+    frame, is_series = _prepare(prices, "prices", ordered=True, positive=True)
+    counts = _require_obs(frame, "max_drawdown", "prices")
+    _warn_short_sample("max_drawdown", counts, "prices")
+
+    def worst_fall(column: pd.Series) -> float:
+        valid = column.dropna()
+        return float((1.0 - valid / valid.cummax()).max())
+
+    result = pd.Series(
+        [worst_fall(frame.iloc[:, i]) for i in range(frame.shape[1])],
+        index=frame.columns,
+        dtype="float64",
+    )
+    return _finish_scalar(result, is_series)
+
+
+def historical_var(returns, confidence=0.95, *, _skip_prices_check=False):
+    """One-day historical Value at Risk: a loss that was not exceeded on ``confidence`` of the days.
+
+    Formula: ``VaR = -quantile(returns, 1 - confidence)``. Sort the past daily returns,
+    find the worst ``(1 - confidence)`` share (the lower tail), and take its edge, with
+    the sign flipped. Example: at 95% confidence, "VaR = 0.03" means that on 95% of
+    past days the loss was 3% or less (on the worst 5% of days it was bigger).
+
+    SIGN: returned as a POSITIVE loss (0.03 = a 3% loss), the same convention as
+    ``max_drawdown``. Units: a fraction of the position value over ONE day. It is not
+    scaled to longer horizons.
+
+    Quantile method: LINEAR interpolation (the numpy / pandas default). With n sorted
+    returns, the quantile sits at position ``(1 - confidence) * (n - 1)`` (counting from
+    0), and if that is between two observations we blend them in proportion. Example:
+    6 returns, confidence 0.95 puts the quantile 0.25 of the way from the worst to the
+    second-worst return. Other methods ("lower", "nearest", ...) give slightly
+    different numbers on small samples; the tests pin this one.
+
+    All-gains case: if even the tail days were gains (every return positive), the
+    quantile is positive and the VaR comes out NEGATIVE (for example -0.0125). We return
+    that as it is rather than clipping it to 0: the function stays exactly
+    ``-quantile``, and a negative VaR reads "there was no loss at this confidence level".
+    The sign is never flipped silently.
+
+    ``confidence`` must be strictly between 0 and 1, otherwise ValueError. Needs at least
+    2 valid returns per column, otherwise ValueError. Prices passed by mistake (median
+    absolute value above 0.5, a heuristic for typical stock prices) are refused too. NaN
+    returns are dropped per column. (``_skip_prices_check`` is private, used only by
+    ``risk_summary``. Do not pass it.)
+
+    Warnings (ShortSampleWarning, in addition to each other):
+    - fewer than ``MIN_RELIABLE_OBS`` (60) valid returns, like the other statistics;
+    - fewer than ``MIN_TAIL_OBS`` (5) observations in the tail, i.e.
+      ``n * (1 - confidence) < 5``. A quantile built on 1-4 days is an anecdote. At 95%
+      confidence that means fewer than 100 returns; at 99%, fewer than 500.
+    """
+    level = _check_confidence(confidence)
+    frame, is_series = _prepare(returns, "returns", expect_returns=not _skip_prices_check)
+    counts = _require_obs(frame, "historical_var", "returns")
+    _warn_short_sample("historical_var", counts, "returns")
+    _warn_thin_tail("historical_var", counts, level)
+    # DataFrame.quantile skips NaN per column, so each ticker uses its own valid returns.
+    quantile = frame.quantile(1.0 - level, interpolation="linear")
+    return _finish_scalar(-quantile, is_series)
+
+
+def sharpe_ratio(returns, risk_free_rate=0.0, *, _skip_prices_check=False):
+    """Annualized Sharpe ratio: return earned per unit of risk, above the risk-free rate.
+
+    Formula: ``mean(r - rf_daily) / std(r, ddof=1) * sqrt(252)``, with
+    ``rf_daily = risk_free_rate / 252``. In words: the average daily return above the
+    risk-free rate, divided by the daily standard deviation (sample formula), scaled
+    to a year by sqrt(252). Units: a plain number, no percent (1.0 is decent, 2.0 is
+    very good).
+
+    ``risk_free_rate`` is an ANNUAL fraction (0.04 = 4% a year); the default 0.0 gives
+    the plain return-per-risk ratio. Negative rates are allowed. This uses the
+    ARITHMETIC mean of daily returns, unlike ``annualized_return`` (geometric).
+
+    Zero volatility: if a column's returns are all identical (standard deviation 0), the
+    ratio is undefined, and we raise ValueError naming the column rather than return a
+    silent NaN or infinity. A perfectly flat price for 60+ days usually means stale or
+    broken data, so a loud error is the useful answer.
+
+    Gaps: NaN returns are dropped per column. Needs at least 2 valid returns per column,
+    otherwise ValueError. Prices passed by mistake (median absolute value above 0.5, a
+    heuristic for typical stock prices) are refused too. (``_skip_prices_check`` is
+    private, used only by ``risk_summary``. Do not pass it.) Warns (ShortSampleWarning) below ``MIN_RELIABLE_OBS`` valid
+    returns.
+    """
+    annual_rf = _real_number(risk_free_rate, "risk_free_rate")
+    frame, is_series = _prepare(returns, "returns", expect_returns=not _skip_prices_check)
+    counts = _require_obs(frame, "sharpe_ratio", "returns")
+    spread = frame.std(ddof=1)
+    flat = spread < _ZERO_STD
+    if flat.any():
+        bad = ", ".join(repr(c) for c in flat[flat].index)
+        raise ValueError(
+            f"sharpe_ratio: the returns of {bad} are all identical (standard deviation 0), "
+            "so the Sharpe ratio is undefined. Check the data for stale prices."
+        )
+    _warn_short_sample("sharpe_ratio", counts, "returns")
+    daily_rf = annual_rf / TRADING_DAYS_PER_YEAR
+    excess_mean = (frame - daily_rf).mean()
+    return _finish_scalar(excess_mean / spread * _SQRT_TRADING_DAYS, is_series)
+
+
+def risk_summary(prices, confidence=0.95, risk_free_rate=0.0):
+    """One table of the headline risk numbers, one row per ticker, ready for the dashboard.
+
+    Input: adjusted close prices (a DataFrame, or a Series for one ticker), oldest first.
+    Designed for exchange-traded stocks/ETFs (252 trading days a year). Assets that trade
+    7 days a week (e.g. crypto) will be annualized incorrectly (BTC in 2024 returned
+    +111.5%, but this shows 67.7%).
+
+    The table is built ONLY by calling the functions in this module, one ticker at a time,
+    so every number can be traced back to one of them and a ticker's row never depends on
+    the other tickers in the table. Columns:
+        annualized_return      ``annualized_return`` of the daily returns (geometric), a fraction
+        annualized_volatility  ``annualized_volatility`` of the daily returns, a fraction
+        sharpe_ratio           ``sharpe_ratio`` with the given ``risk_free_rate``; a plain
+                               number, not a fraction
+        max_drawdown           ``max_drawdown`` of the prices, a positive fraction
+        var_95                 one-day ``historical_var`` at ``confidence``, a positive
+                               fraction; the column is named after the confidence (0.99
+                               gives ``var_99``)
+        n_obs                  number of valid daily returns calculated for that ticker, a
+                               count (0 if none were calculated)
+
+    A ticker that cannot be calculated does not spoil the table. If it has fewer than 2
+    valid returns (for example a ticker that is NaN except for its last 2 days), its
+    returns are all identical (zero volatility, so no Sharpe ratio), or it has a zero or
+    negative price (some providers return 0.0 for a broken day), its row is NaN and one
+    ``SkippedTickerWarning`` names the ticker and the reason. For the first two reasons
+    ``n_obs`` still shows the real count; for a bad price it is 0 (nothing was calculated).
+    The other tickers are calculated as usual. If NO ticker can be calculated, ValueError
+    is raised, listing the reasons. The individual functions keep raising for such input.
+
+    The "looks like prices" check of the return functions is not applied here: the returns
+    are computed from the prices inside, so they are known to be returns. A real but wild
+    ticker (GME in January 2021: +18%, +93%, +135%) is therefore calculated, not skipped.
+
+    Other warnings: instead of up to four warnings per ticker (one from each function),
+    it emits at most one of each kind, for the tickers that were calculated: a
+    ``GapWarning`` (tickers with bridged returns and their longest bridge, see
+    ``daily_returns``), a ``ShortSampleWarning`` for fewer than ``MIN_RELIABLE_OBS`` valid
+    returns, and a ``ShortSampleWarning`` for too few observations in the VaR tail. They
+    name the ticker and the count.
+
+    Bad ``confidence`` / ``risk_free_rate``, or prices that are not valid input (not
+    numeric, infinite, not in date order, ...), raise ValueError as in the functions it calls.
+    """
+    level = _check_confidence(confidence)
+    _real_number(risk_free_rate, "risk_free_rate")  # fail early, not once per ticker
+    # positive=False on purpose: a zero/negative price spoils only its own ticker (below).
+    frame, _ = _prepare(prices, "prices", ordered=True)  # a Series becomes 1 column
+
+    skipped: dict = {}
+    valid_prices = frame.count()
+    for label in valid_prices.index[valid_prices < 2]:
+        skipped[label] = f"only {valid_prices[label]} valid price(s), so no return can be calculated"
+    for label in frame.columns[(frame <= 0).any()]:
+        first_bad = frame.index[(frame[label] <= 0).to_numpy()][0]
+        when = first_bad.strftime("%Y-%m-%d") if hasattr(first_bad, "strftime") else str(first_bad)
+        skipped[label] = f"has a zero or negative price on {when}"  # (overrides "too few prices")
+    usable = frame.loc[:, [label not in skipped for label in frame.columns]]
+
+    rows: dict = {}
+    n_obs = pd.Series(0, index=frame.columns, dtype="int64")
+    with warnings.catch_warnings():
+        # The consolidated warnings below replace the per-function ones.
+        warnings.simplefilter("ignore", ShortSampleWarning)
+        warnings.simplefilter("ignore", GapWarning)
+        if usable.shape[1]:
+            returns = daily_returns(usable)
+            n_obs.loc[usable.columns] = returns.count().to_numpy()
+            for label in usable.columns:
+                try:
+                    rows[label] = [
+                        annualized_return(returns[label], _skip_prices_check=True),
+                        annualized_volatility(returns[label], _skip_prices_check=True),
+                        sharpe_ratio(returns[label], risk_free_rate, _skip_prices_check=True),
+                        max_drawdown(usable[label]),
+                        historical_var(returns[label], level, _skip_prices_check=True),
+                    ]
+                except ValueError as error:
+                    # Only data problems can land here, because the inputs were validated
+                    # above: too few valid returns, or a flat price (Sharpe undefined).
+                    # The "looks like prices" check is skipped, see the docstring.
+                    skipped[label] = str(error)
+
+    if not rows:
+        reasons = "; ".join(f"{label!r}: {reason}" for label, reason in skipped.items())
+        raise ValueError(f"risk_summary: no ticker could be calculated. {reasons}")
+
+    names = ["annualized_return", "annualized_volatility", "sharpe_ratio", "max_drawdown", f"var_{level * 100:g}"]
+    summary = pd.DataFrame.from_dict(rows, orient="index", columns=names).reindex(frame.columns)
+    summary["n_obs"] = n_obs
+    summary.index.name = "Ticker"
+
+    if skipped:
+        detail = "; ".join(f"{label!r}: {skipped[label]}" for label in frame.columns if label in skipped)
+        warnings.warn(
+            f"risk_summary: could not calculate {len(skipped)} ticker(s); their rows are NaN. {detail}",
+            SkippedTickerWarning,
+            stacklevel=2,
+        )
+    calculated = list(rows)
+    _warn_gaps("risk_summary", _bridge_stats(usable[calculated]))
+    _warn_short_sample("risk_summary", n_obs.loc[calculated], "returns")
+    _warn_thin_tail("risk_summary", n_obs.loc[calculated], level)
+    return summary

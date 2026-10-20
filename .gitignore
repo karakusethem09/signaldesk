@@ -1,0 +1,26 @@
+# Python virtual environment (recreate with: python3 -m venv .venv && pip install -r requirements.txt)
+.venv/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Downloaded price cache (regenerated automatically)
+data/cache/
+
+# Test / tooling caches
+.pytest_cache/
+
+# Personal Claude Code settings for this machine (never shared)
+.claude/settings.local.json
+
+# Secrets (API keys etc.), never committed
+.env
+.env.*
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Original starter bundle (its contents are already unpacked into this repo)
+signaldesk-starter.zip
