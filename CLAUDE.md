@@ -21,7 +21,7 @@ together, while also building a strong portfolio piece.
 
 ## Phases
 
-### Phase 1: Dashboard (current phase)
+### Phase 1: Dashboard (done)
 A dashboard with a few stocks showing performance, volatility, correlations and
 risk, using our own calculations.
 
@@ -30,6 +30,20 @@ Rules:
   not inside the dashboard code. These functions will later be the agents' tools.
 - Every calculation function gets a test with a known expected result.
 - Functions should be deterministic: same input, same output.
+
+### Phase 1.5: Public website (current phase)
+Deploy the dashboard on Streamlit Community Cloud so recruiters can open it, while
+keeping it useful for my own analysis. Work happens on the `phase-1.5` branch and
+reaches `main` (the live site) only through a reviewed pull request.
+
+Rules:
+- Phase 1 rules still apply. Existing functions in `data.py` and `risk.py` keep their
+  names, inputs and behaviour; new work is added next to them.
+- The default view is a demo portfolio loaded from a committed snapshot, so it works
+  even when Yahoo Finance is down or blocks the server.
+- Live data requests are limited on the public site (ticker count, date span, rate).
+- Stay on Streamlit (no React/Next.js). No new runtime dependencies unless approved.
+- All tests stay offline.
 
 ### Phase 2: Agents (later, one at a time)
 A supervisor agent that delegates to specialist agents. Build them in this order:
