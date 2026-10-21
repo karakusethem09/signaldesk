@@ -27,11 +27,12 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
+            constraints.txt
 
-      - name: Install dependencies
+      - name: Install dependencies (exact versions the suite was tested with)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          pip install -r requirements-dev.txt -c constraints.txt
 
       - name: Run tests
         run: pytest -q
