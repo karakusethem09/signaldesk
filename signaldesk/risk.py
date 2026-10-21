@@ -83,6 +83,8 @@ Portfolios (``portfolio_value``)
     docstring for how the start date and missing prices are handled. If a late-starting
     holding makes the portfolio start after the first row of the table, a ``ShortSampleWarning``
     names it and the dropped dates: compare the portfolio with a benchmark on the same dates.
+    ``normalize_weights`` turns percentages or any relative numbers (20, 20, 15 ... or 1, 1, 1)
+    into weights that add up to 1, for ``portfolio_value``.
 """
 
 from __future__ import annotations
@@ -113,6 +115,7 @@ __all__ = [
     "drawdown_series",
     "historical_var",
     "max_drawdown",
+    "normalize_weights",
     "portfolio_value",
     "return_correlation",
     "risk_summary",
@@ -915,21 +918,32 @@ def _warn_shortened_history(caller: str, frame: pd.DataFrame, start: int) -> Non
     """Emit ONE ShortSampleWarning when the portfolio starts later than the first row of the table.
 
     ``frame`` is the held prices BEFORE trimming and ``start`` is the position of the first
-    row where every holding has a price. Nothing is emitted when ``start`` is 0. The tickers
-    named are the ones that moved the start: those with no price on the last dropped row
-    (take them away and the portfolio could start at least one row earlier). Each is shown with
-    how many of the dropped rows it is missing on. Same ``stacklevel`` rule as ``_warn_gaps``.
+    row where every holding has a price. Nothing is emitted when ``start`` is 0.
+
+    The tickers named are EVERY held ticker with at least one missing price in the dropped rows,
+    most missing first (ties keep the table's column order). Each is shown with its first valid
+    price date and how many of the dropped rows it is missing on. That list is always true as
+    "on each dropped date at least one of these holdings had no price": a dropped row is
+    one where some holding is missing, and that holding is in the list. We do NOT try to name
+    "the" ticker that decided the start, because that is not well defined (a one-day holiday
+    on the last dropped row would look like the cause, and a ticker that starts long before it
+    would be left out). Same ``stacklevel`` rule as ``_warn_gaps``.
     """
     if start == 0:
         return
-    dropped = frame.iloc[:start]
-    blockers = frame.columns[frame.iloc[start - 1].isna().to_numpy()]
-    detail = ", ".join(f"{label!r} (no price on {int(dropped[label].isna().sum())} of the dropped rows)" for label in blockers)
+    missing = frame.iloc[:start].isna().sum()
+    named = sorted(((label, int(n)) for label, n in missing.items() if n > 0), key=lambda item: -item[1])
+    detail = ", ".join(
+        f"{label!r} (first price {_date_text(frame[label].first_valid_index())}, no price on {n} of the dropped rows)"
+        for label, n in named
+    )
     first, last_dropped, new_start, last = (_date_text(frame.index[i]) for i in (0, start - 1, start, -1))
+    dropped_dates = f"on {first}" if start == 1 else f"{first} to {last_dropped}"
     warnings.warn(
         f"{caller}: the portfolio starts on {new_start}, not on the first date of prices ({first}). "
         f"Dropped because not every holding had a price yet: {_rows(start)} of {len(frame)} "
-        f"({first} to {last_dropped}). The start was moved by {detail}. The portfolio covers {_rows(len(frame) - start)} "
+        f"({dropped_dates}). On each dropped date at least one of these holdings had no price: {detail}. "
+        f"The portfolio covers {_rows(len(frame) - start)} "
         f"({new_start} to {last}), a shorter period than the table. Any comparison with another series "
         "(a benchmark, for example) must use the same dates, otherwise the two sets of numbers describe "
         "different periods.",
@@ -1015,9 +1029,10 @@ def portfolio_value(prices, weights):
     it, ValueError.
 
     SHORTER HISTORY WARNING: when the start date is later than the first row of ``prices``,
-    ONE ``ShortSampleWarning`` says so. It names the ticker(s) that moved the start (those with
-    no price on the last dropped row), how many rows were dropped and from which date to which
-    date, and that any comparison with another series (a benchmark) must use the same dates.
+    ONE ``ShortSampleWarning`` says so. It names EVERY held ticker with a missing price in the
+    dropped rows (most missing first, each with its first price date and its count of missing
+    dropped rows), how many rows were dropped and from which date to which date, and that any
+    comparison with another series (a benchmark) must use the same dates.
     Without it a late starter would silently make the portfolio cover a shorter period than the
     benchmark next to it. No warning when the portfolio starts on the first row.
 
@@ -1173,3 +1188,53 @@ def return_correlation(prices):
         )
     returns = daily_returns(prices)
     return correlation_matrix(returns, _skip_prices_check=True)
+
+
+def normalize_weights(raw) -> dict:
+    """Rescale any non-negative numbers so they add up to 1: the weights ``portfolio_value`` wants.
+
+    This is ONLY a rescaling. Formula: ``w_i = x_i / sum(x)``. Nothing else changes: not the
+    order, not the spelling of the tickers (that is ``limits.normalize_tickers``' job), and a
+    ticker is not checked against any price table. Units do not matter, only the proportions:
+    percentages 20, 20, 15, 15, 15, 15 become 0.20, 0.20, 0.15, 0.15, 0.15, 0.15; the "equal
+    weight" input 1, 1, 1 becomes 1/3 each; 1 and 3 become 0.25 and 0.75; and input that
+    already adds up to 1 comes back unchanged (up to float noise). A weight of 0 stays 0.0.
+
+    Input: a Mapping (dict) or a pandas Series of ``ticker -> number``. Numbers can be Python or
+    numpy numbers (ints, floats, even float32).
+
+    Output: a NEW dict, in the same order as the input, whose values are plain Python ``float``
+    (not numpy floats, which would carry float32 rounding along), adding up to 1 within 1e-12
+    and accepted by ``portfolio_value`` as it is. The input is never modified.
+
+    ValueError, in plain words, for: input that is not a dict or Series, no weights at all,
+    a weight that is not a number (text, True/False, missing, NaN, infinity), a negative
+    weight (only long positions are supported for now), and weights that are all zero.
+    """
+    if isinstance(raw, pd.Series):
+        if raw.index.has_duplicates:
+            raise ValueError("The weights list the same ticker more than once; every ticker must appear once.")
+        items = list(raw.items())
+    elif isinstance(raw, Mapping):
+        items = list(raw.items())
+    else:
+        raise ValueError(
+            f"The weights must be a dict or a pandas Series of ticker -> number, got {type(raw).__name__}."
+        )
+    if not items:
+        raise ValueError("No weights were given. Enter at least one holding with a weight.")
+
+    numbers_in = {ticker: _real_number(value, f"The weight of {ticker!r}") for ticker, value in items}
+    negative = [ticker for ticker, value in numbers_in.items() if value < 0.0]
+    if negative:
+        detail = ", ".join(f"{ticker!r}: {numbers_in[ticker]:g}" for ticker in negative)
+        raise ValueError(f"Weights cannot be negative ({detail}). Only long positions are supported for now.")
+    biggest = max(numbers_in.values())
+    if biggest == 0.0:
+        raise ValueError("All the weights are zero. At least one holding needs a weight above 0.")
+
+    # Divide by the biggest first, so the sum below is at least 1 and cannot overflow (1e308 + 1e308)
+    # or vanish. Mathematically the same as x / sum(x). `+ 0.0` turns a -0.0 into 0.0.
+    ratios = {ticker: value / biggest for ticker, value in numbers_in.items()}
+    total = math.fsum(ratios.values())
+    return {ticker: float(ratio / total) + 0.0 for ticker, ratio in ratios.items()}

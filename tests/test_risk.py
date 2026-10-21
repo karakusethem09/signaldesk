@@ -1566,11 +1566,13 @@ def test_the_prices_guard_limit_is_documented():
 
 import inspect  # noqa: E402  (appended section: the imports sit next to the tests that use them)
 import json  # noqa: E402
+import re  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from signaldesk import data  # noqa: E402
 from signaldesk.risk import (  # noqa: E402
     drawdown_series,
+    normalize_weights,
     portfolio_value,
     return_correlation,
     rolling_volatility,
@@ -2289,7 +2291,8 @@ def test_a_late_starting_holding_warns_with_the_ticker_the_dropped_rows_and_date
     message = messages[0]
     first, last_dropped, start, last = (f"{prices.index[i]:%Y-%m-%d}" for i in (0, late - 1, late, -1))
     assert message.startswith("portfolio_value:")
-    assert "'NVDA' (no price on " + str(late) + " of the dropped rows)" in message  # the ticker that moved the start
+    # NVDA is the only holding with missing prices in the dropped rows; its first price is on the new start date
+    assert f"'NVDA' (first price {start}, no price on {late} of the dropped rows)" in message
     for other in ("AAPL", "MSFT", "JPM", "XOM", "JNJ", "SPY"):
         assert other not in message
     assert f"{late} rows of {len(prices)} ({first} to {last_dropped})" in message  # how many, and which dates, were dropped
@@ -2303,22 +2306,125 @@ def test_a_late_starting_holding_warns_with_the_ticker_the_dropped_rows_and_date
     pd.testing.assert_frame_equal(prices, before)  # the caller's table is untouched
 
 
-def test_the_shorter_history_warning_names_only_the_tickers_that_moved_the_start():
-    # A starts on row 2, B on row 4, C on row 0: B is what decides the start (row 4). Taking A away would not help.
+def test_the_shorter_history_warning_names_every_holding_missing_in_the_dropped_rows_most_missing_first():
+    # A starts on row 2, B on row 4, C on row 0. Dropped rows: 0-3. A is missing on 2 of them, B on 4, C on none.
+    # BOTH late starters are named (a visitor must not think A has a full history), the most missing first
+    # (B: 4, then A: 2), each with its first price date. C has a full history and is not named.
     prices = make_frame({"A": [NAN, NAN, 10, 11, 12, 13], "B": [NAN, NAN, NAN, NAN, 20, 22], "C": [5, 5, 6, 6, 7, 7]})
+    day = lambda i: f"{prices.index[i]:%Y-%m-%d}"  # noqa: E731
     message = messages_of(ShortSampleWarning, portfolio_value, prices, {"A": 0.3, "B": 0.3, "C": 0.4})[0]
-    assert "'B' (no price on 4 of the dropped rows)" in message
-    assert "'A'" not in message and "'C'" not in message
-    assert f"4 rows of 6 ({prices.index[0]:%Y-%m-%d} to {prices.index[3]:%Y-%m-%d})" in message
-    # two tickers that start together are both named
+    assert f"'B' (first price {day(4)}, no price on 4 of the dropped rows)" in message
+    assert f"'A' (first price {day(2)}, no price on 2 of the dropped rows)" in message
+    assert message.index("'B'") < message.index("'A'")
+    assert "'C'" not in message
+    assert f"4 rows of 6 ({day(0)} to {day(3)})" in message
+    assert "On each dropped date at least one of these holdings had no price" in message
+    # equal counts keep the column order of the table
     both = make_frame({"A": [NAN, NAN, 10, 11], "B": [NAN, NAN, 20, 22], "C": [5, 5, 6, 6]})
     message = messages_of(ShortSampleWarning, portfolio_value, both, {"A": 0.3, "B": 0.3, "C": 0.4})[0]
-    assert "'A' (no price on 2 of the dropped rows)" in message and "'B' (no price on 2 of the dropped rows)" in message
-    # a gap in the middle that pushes the start back counts too (A: NaN, 100, 100, 110   B: 50, NaN, 40, 44 -> start row 2)
+    assert "'A' (first price" in message and "no price on 2 of the dropped rows" in message
+    assert message.index("'A'") < message.index("'B'") and "'C'" not in message
+    # a gap in the middle that pushes the start back: A: NaN, 100, 100, 110   B: 50, NaN, 40, 44 -> start row 2.
+    # Row 0 is dropped because of A, row 1 because of B: both are named, once each.
     gap = make_frame({"A": [NAN, 100, 100, 110], "B": [50, NAN, 40, 44]})
     message = messages_of(ShortSampleWarning, portfolio_value, gap, half_half())[0]
-    assert "'B' (no price on 1 of the dropped rows)" in message and "'A'" not in message
+    assert f"'A' (first price {day(1)}, no price on 1 of the dropped rows)" in message
+    assert f"'B' (first price {day(0)}, no price on 1 of the dropped rows)" in message
     assert "2 rows of 4" in message
+
+
+def test_a_one_day_holiday_on_the_last_dropped_row_is_named_with_its_small_count(demo):
+    # NVDA starts late; JPM merely had a one-day holiday on the LAST dropped row. Removing JPM would not move
+    # the start, but it IS one of the holdings that had no price on a dropped date, so it is named, with
+    # its count of 1 and its first price on row 0 (so nobody reads it as a late starter).
+    prices, late = late_nvda_prices(demo)
+    prices.iloc[late - 1, prices.columns.get_loc("JPM")] = np.nan
+    day = lambda i: f"{prices.index[i]:%Y-%m-%d}"  # noqa: E731
+    message = messages_of(ShortSampleWarning, portfolio_value, prices, demo.holdings)[0]
+    assert f"'NVDA' (first price {day(late)}, no price on {late} of the dropped rows)" in message
+    assert f"'JPM' (first price {day(0)}, no price on 1 of the dropped rows)" in message
+    assert message.index("'NVDA'") < message.index("'JPM'")  # most missing first
+    for other in ("AAPL", "MSFT", "XOM", "JNJ", "SPY"):
+        assert other not in message
+
+
+def test_two_late_starters_are_both_named_in_count_order(demo):
+    # JPM starts about a quarter of the way in, XOM more than half way: the start is XOM's, but JPM's
+    # shorter history must be visible too.
+    prices = demo.prices.copy()
+    n = len(prices)
+    jpm_rows, xom_rows = n // 4, (5 * n) // 9
+    prices.iloc[:jpm_rows, prices.columns.get_loc("JPM")] = np.nan
+    prices.iloc[:xom_rows, prices.columns.get_loc("XOM")] = np.nan
+    day = lambda i: f"{prices.index[i]:%Y-%m-%d}"  # noqa: E731
+    message = messages_of(ShortSampleWarning, portfolio_value, prices, demo.holdings)[0]
+    assert f"'XOM' (first price {day(xom_rows)}, no price on {xom_rows} of the dropped rows)" in message
+    assert f"'JPM' (first price {day(jpm_rows)}, no price on {jpm_rows} of the dropped rows)" in message
+    assert message.index("'XOM'") < message.index("'JPM'")
+    assert f"{xom_rows} rows of {n} ({day(0)} to {day(xom_rows - 1)})" in message
+    for other in ("AAPL", "MSFT", "NVDA", "JNJ", "SPY"):
+        assert other not in message
+
+
+def test_the_shorter_history_warning_is_always_true_on_random_gap_patterns():
+    # Property test on seeded random tables: parse the warning and compare it with the table itself.
+    # Every named ticker has the stated count of missing dropped rows and its stated first price date;
+    # no ticker with a missing dropped row is left out; the order is by count, most first; and on every
+    # dropped date at least one named ticker has no price.
+    rng = np.random.default_rng(11)
+    pattern = re.compile(r"'(\w+)' \(first price (\S+), no price on (\d+) of the dropped rows\)")
+    warned = 0
+    for _ in range(150):
+        values = rng.uniform(10, 20, size=(12, 4))
+        values[rng.random(values.shape) < 0.3] = np.nan
+        values[8:] = rng.uniform(10, 20, size=(4, 4))  # the last 4 rows are complete, so a start exists
+        prices = pd.DataFrame(values, index=dates(12), columns=list("ABCD"))
+        weights = {c: 0.25 for c in prices.columns}
+        start = int(np.argmax(prices.notna().all(axis=1).to_numpy()))
+        messages = messages_of(ShortSampleWarning, portfolio_value, prices, weights)
+        if start == 0:
+            assert messages == []
+            continue
+        warned += 1
+        assert len(messages) == 1
+        named = [(m[0], m[1], int(m[2])) for m in pattern.findall(messages[0])]
+        dropped = prices.iloc[:start]
+        expected = {c: int(dropped[c].isna().sum()) for c in prices.columns if dropped[c].isna().any()}
+        assert {name: count for name, _, count in named} == expected
+        assert all(first == f"{prices[name].first_valid_index():%Y-%m-%d}" for name, first, _ in named)
+        counts = [count for _, _, count in named]
+        assert counts == sorted(counts, reverse=True)
+        for row in range(start):
+            assert any(np.isnan(prices[name].iloc[row]) for name, _, _ in named)
+    assert warned > 50  # the random tables really exercised the warning
+
+
+def test_exactly_one_dropped_row_says_on_that_date(demo):
+    # The most common real case: the first row is missing for one holding. "on DATE", not "DATE to DATE".
+    prices = make_frame({"A": [NAN, 100, 101, 102], "B": [50, 51, 52, 53]})
+    day = lambda i: f"{prices.index[i]:%Y-%m-%d}"  # noqa: E731
+    message = messages_of(ShortSampleWarning, portfolio_value, prices, half_half())[0]
+    assert f"1 row of 4 (on {day(0)})" in message
+    assert f"{day(0)} to {day(0)}" not in message
+    assert f"'A' (first price {day(1)}, no price on 1 of the dropped rows)" in message and "'B'" not in message
+    assert f"starts on {day(1)}" in message and "covers 3 rows" in message
+    # the same on the real snapshot: AAPL has no price on the first day (an exchange holiday, say)
+    real = demo.prices.copy()
+    real.iloc[0, real.columns.get_loc("AAPL")] = np.nan
+    with pytest.warns(ShortSampleWarning, match=r"1 row of \d+ \(on \d{4}-\d\d-\d\d\)") as record:
+        value = portfolio_value(real, demo.holdings)
+    assert len(record) == 1 and len(value) == len(real) - 1 and value.index[0] == real.index[1]
+
+
+def test_a_named_ticker_with_gaps_after_the_start_counts_only_its_dropped_rows():
+    # B = [NaN, NaN, 20, NaN, 22]: missing on rows 0-1 (before the start, dropped) and on row 3 (after it).
+    # Only the two dropped rows count: "2 of the dropped rows", never 3.
+    prices = make_frame({"A": [100, 101, 102, 103, 104], "B": [NAN, NAN, 20, NAN, 22]})
+    message = messages_of(ShortSampleWarning, portfolio_value, prices, half_half())[0]
+    assert f"'B' (first price {prices.index[2]:%Y-%m-%d}, no price on 2 of the dropped rows)" in message
+    assert "no price on 3" not in message and "2 rows of 5" in message
+    # the row-3 gap is a separate matter: valued at B's last price, with its own GapWarning
+    assert "'B': 1 valued at last price" in messages_of(GapWarning, portfolio_value, prices, half_half())[0]
 
 
 def test_no_shorter_history_warning_when_every_holding_starts_on_the_first_row(demo):
@@ -2344,7 +2450,7 @@ def test_the_shorter_history_warning_points_at_the_caller(demo):
 def test_the_shorter_history_warning_comes_with_the_value_not_instead_of_it():
     # still a warning, never an error: the late-starter table gives the same numbers as before
     prices = make_frame({"A": [100, 110, 121, 133.1], "B": [NAN, NAN, 20, 22]})
-    with pytest.warns(ShortSampleWarning, match=r"'B' \(no price on 2 of the dropped rows\)"):
+    with pytest.warns(ShortSampleWarning, match=r"'B' \(first price [\d-]+, no price on 2 of the dropped rows\)"):
         value = portfolio_value(prices, half_half())
     assert value.tolist() == pytest.approx([1.0, 1.10], abs=1e-12)  # same as the late-starter test above
     assert issubclass(ShortSampleWarning, UserWarning) and "ShortSampleWarning" in risk.__all__
@@ -2359,3 +2465,112 @@ def test_portfolio_name_is_exported():
     assert portfolio_value(GOOD_PRICES, half_half()).name == risk.PORTFOLIO_NAME
     for name in risk.__all__:  # every exported name really exists
         assert hasattr(risk, name)
+
+
+# --------------------------------------------------------------------------- #
+# normalize_weights: percentages or any relative numbers -> weights that add up to 1
+# --------------------------------------------------------------------------- #
+
+def test_normalize_weights_percentages_become_fractions():
+    # 20 + 20 + 15 + 15 + 15 + 15 = 100, so every weight is divided by 100: 0.20, 0.20, 0.15, ...
+    raw = {"AAPL": 20, "MSFT": 20, "NVDA": 15, "JPM": 15, "XOM": 15, "JNJ": 15}
+    result = normalize_weights(raw)
+    assert list(result) == list(raw)  # same order
+    assert list(result.values()) == pytest.approx([0.20, 0.20, 0.15, 0.15, 0.15, 0.15], abs=1e-15)
+    assert abs(sum(result.values()) - 1.0) < 1e-12
+
+
+def test_normalize_weights_equal_weight_and_proportions():
+    # 1, 1, 1 -> 1/3 each
+    assert list(normalize_weights({"A": 1, "B": 1, "C": 1}).values()) == pytest.approx([1 / 3] * 3, abs=1e-15)
+    # only the proportions matter: 1 : 3 is 0.25 : 0.75, whatever the unit (exact in binary floating point)
+    for raw in ({"A": 1, "B": 3}, {"A": 100, "B": 300}, {"A": 0.5, "B": 1.5}, {"A": 25.0, "B": 75.0}):
+        assert normalize_weights(raw) == {"A": 0.25, "B": 0.75}
+    # input that already adds up to 1 comes back unchanged
+    assert normalize_weights({"A": 0.5, "B": 0.25, "C": 0.25}) == {"A": 0.5, "B": 0.25, "C": 0.25}
+
+
+def test_normalize_weights_zero_stays_zero():
+    # 0, 5, 15 -> 0 / 20, 5 / 20, 15 / 20
+    result = normalize_weights({"A": 0, "B": 5, "C": 15, "D": -0.0})
+    assert result == {"A": 0.0, "B": 0.25, "C": 0.75, "D": 0.0}
+    assert str(result["D"]) == "0.0"  # -0.0 is turned into a plain 0.0
+    assert normalize_weights({"A": 0, "B": 7}) == {"A": 0.0, "B": 1.0}
+    assert normalize_weights({"ONLY": 42}) == {"ONLY": 1.0}
+
+
+def test_normalize_weights_returns_plain_python_floats_in_a_new_dict():
+    raw = {"A": np.float32(0.2), "B": np.int64(3), "C": np.float64(1.5), "D": 2}
+    snapshot = dict(raw)
+    result = normalize_weights(raw)
+    assert result is not raw and raw == snapshot  # a new dict, the input is untouched
+    assert all(type(value) is float for value in result.values())  # not np.float32 / np.float64
+    assert all(type(key) is str for key in result)
+    assert abs(sum(result.values()) - 1.0) < 1e-12
+    # a pandas Series works too, with the same result, and is not modified
+    series = pd.Series({"A": 20.0, "B": 30.0, "C": 50.0})
+    before = series.copy()
+    assert normalize_weights(series) == {"A": 0.2, "B": 0.3, "C": 0.5}
+    assert all(type(value) is float for value in normalize_weights(series).values())
+    pd.testing.assert_series_equal(series, before)
+
+
+def test_normalize_weights_does_not_overflow_or_vanish_on_extreme_numbers():
+    assert normalize_weights({"A": 1e308, "B": 1e308}) == {"A": 0.5, "B": 0.5}
+    tiny = normalize_weights({"A": 5e-324, "B": 5e-324, "C": 1e-300})
+    assert abs(sum(tiny.values()) - 1.0) < 1e-12 and tiny["A"] == tiny["B"]
+
+
+@pytest.mark.parametrize("bad", ["20", None, True, False, [20], float("nan"), float("inf"), float("-inf"), pd.NA, 1 + 2j])
+def test_normalize_weights_rejects_values_that_are_not_numbers(bad):
+    with pytest.raises(ValueError, match=r"The weight of 'MSFT' must be a finite number"):
+        normalize_weights({"AAPL": 10, "MSFT": bad})
+
+
+def test_normalize_weights_rejects_empty_negative_all_zero_and_wrong_types():
+    for empty in ({}, pd.Series(dtype="float64")):
+        with pytest.raises(ValueError, match="No weights were given"):
+            normalize_weights(empty)
+    with pytest.raises(ValueError, match=r"Weights cannot be negative \('MSFT': -5\)"):
+        normalize_weights({"AAPL": 105, "MSFT": -5})
+    with pytest.raises(ValueError, match="All the weights are zero"):
+        normalize_weights({"AAPL": 0, "MSFT": 0.0})
+    for bad in ([20, 80], (20, 80), np.array([20.0, 80.0]), None, 5, "AAPL"):
+        with pytest.raises(ValueError, match="dict or a pandas Series"):
+            normalize_weights(bad)
+    with pytest.raises(ValueError, match="more than once"):
+        normalize_weights(pd.Series([1, 2], index=["A", "A"]))
+    with pytest.raises(ValueError, match="finite number"):  # a NaN in a Series
+        normalize_weights(pd.Series({"A": 1.0, "B": np.nan}))
+    # the messages are for visitors: no function names or developer jargon
+    for bad in ({}, {"A": -1, "B": 2}, {"A": 0}, {"A": "x"}, [1]):
+        with pytest.raises(ValueError) as caught:
+            normalize_weights(bad)
+        assert "portfolio_value" not in str(caught.value) and "normalize_weights" not in str(caught.value)
+
+
+def test_portfolio_value_accepts_normalized_percentages_equal_weights_and_float32(demo):
+    reference = portfolio_value(demo.prices, demo.holdings)
+    # percentages as typed by a visitor: the same portfolio as the 0.20 / 0.15 weights
+    percentages = {"AAPL": 20, "MSFT": 20, "NVDA": 15, "JPM": 15, "XOM": 15, "JNJ": 15}
+    pd.testing.assert_series_equal(portfolio_value(demo.prices, normalize_weights(percentages)), reference, rtol=1e-12, atol=0)
+    # 1, 1, 1: equal weight. Day one value 1; the end value is the plain average of the three growth multiples.
+    equal = portfolio_value(demo.prices, normalize_weights({"AAPL": 1, "MSFT": 1, "NVDA": 1}))
+    growth = demo.prices[["AAPL", "MSFT", "NVDA"]].iloc[-1] / demo.prices[["AAPL", "MSFT", "NVDA"]].iloc[0]
+    assert equal.iloc[0] == 1.0 and equal.iloc[-1] == pytest.approx(growth.mean(), rel=1e-12)
+    # float32 weights (what a numpy array of float32 would give): raw they do NOT add up to 1 within 1e-9 ...
+    as_float32 = {ticker: np.float32(weight) for ticker, weight in demo.holdings.items()}
+    with pytest.raises(ValueError, match="add up to 1"):
+        portfolio_value(demo.prices, as_float32)
+    # ... but after normalize_weights they are accepted as they are, and the result is the same portfolio
+    fixed = normalize_weights(as_float32)
+    assert abs(sum(fixed.values()) - 1.0) < 1e-12 and all(type(w) is float for w in fixed.values())
+    pd.testing.assert_series_equal(portfolio_value(demo.prices, fixed), reference, rtol=1e-6, atol=0)
+    # weights typed as percentages for a ticker that is not in the table are still caught by portfolio_value
+    with pytest.raises(ValueError, match="not in prices"):
+        portfolio_value(demo.prices, normalize_weights({"AAPL": 50, "NOPE": 50}))
+
+
+def test_normalize_weights_is_exported_and_does_not_touch_ticker_spelling():
+    assert "normalize_weights" in risk.__all__
+    assert list(normalize_weights({" aapl ": 1, "msft": 1})) == [" aapl ", "msft"]  # spelling is limits.normalize_tickers' job
