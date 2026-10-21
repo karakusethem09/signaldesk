@@ -72,13 +72,20 @@ class PriceDataError(ValueError):
 
 
 class ProviderUnavailableError(PriceDataError):
-    """Raised when NO ticker came back, which usually means Yahoo Finance is not answering.
+    """Raised when NO requested ticker came back with any data.
 
-    It is a kind of PriceDataError, so existing ``except PriceDataError`` code still
-    catches it. We cannot tell "Yahoo is rate-limiting or down" apart from "none of these
-    symbols exist" (Yahoo answers both with an empty table), so the message names both
-    possibilities. When only SOME tickers are missing we raise a plain PriceDataError
-    instead, because then the provider clearly works and those symbols are the problem.
+    It is a kind of PriceDataError, so existing ``except PriceDataError`` code still catches
+    it. Yahoo Finance answers three different situations with the same empty table, and we
+    cannot tell them apart, so the message names all three: the provider is rate-limiting or
+    unavailable (try again later), the symbols do not exist, or the dates contain no trading
+    days (a weekend or a market holiday). It is also raised when ``yf.download`` itself
+    raises a rate-limit or network error; in that case the provider is the cause.
+
+    When only SOME tickers are missing we raise a plain PriceDataError instead. That does NOT
+    prove the provider is healthy: yfinance hides a rate limit (or a local error inside
+    yfinance) on a single ticker as "no data for that ticker", exactly like a mistyped
+    symbol. So that message names the missing tickers and gives both likely causes: the
+    symbol may be wrong, or the data provider may have failed for it.
     """
 
 
@@ -260,8 +267,9 @@ def _no_data_for_any_ticker(tickers: list[str], window: str = "") -> ProviderUna
     contain no trading days (a weekend or a market holiday gives an empty table too).
     """
     one = len(tickers) == 1
+    asked = "the requested ticker" if one else "any of the requested tickers"
     return ProviderUnavailableError(
-        f"No price data came back for any of the requested tickers ({', '.join(tickers)})"
+        f"No price data came back for {asked} ({', '.join(tickers)})"
         f"{window}. The data provider may be rate-limiting or unavailable right now "
         f"(try again later), the {'symbol' if one else 'symbols'} may not exist, or there "
         "were no trading days in that period (for example a weekend or a market holiday)."

@@ -1142,6 +1142,24 @@ def test_download_with_no_data_for_any_ticker_raises_provider_unavailable(monkey
     assert "try again later" in message
 
 
+def test_the_no_data_message_uses_singular_wording_for_one_ticker(monkeypatch):
+    patch_yf(monkeypatch, pd.DataFrame())
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPLL"], "2026-01-01", "2026-01-10")
+    message = str(caught.value)
+    assert message.startswith("No price data came back for the requested ticker (AAPLL) between")
+    assert "any of the requested" not in message
+    assert "symbol may not exist" in message
+
+
+def test_the_no_data_message_keeps_plural_wording_for_several_tickers(monkeypatch):
+    patch_yf(monkeypatch, pd.DataFrame())
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+    assert str(caught.value).startswith("No price data came back for any of the requested tickers (AAPL, MSFT) between")
+    assert "symbols may not exist" in str(caught.value)
+
+
 def test_download_with_every_column_all_nan_raises_provider_unavailable(monkeypatch):
     # Rows exist but every ticker is empty: the typical answer of a rate-limiting Yahoo.
     raw = yfinance_style(
@@ -1351,17 +1369,70 @@ def test_load_prices_for_a_weekend_gives_the_no_trading_days_message(monkeypatch
 
 @pytest.fixture
 def real_yf(monkeypatch):
+    """Guard for tests that run the real yf.download: refuse and record any network attempt.
+
+    There are TWO ways to reach the network and the guard needs both:
+      - Python sockets (``socket.connect`` and friends), used by ``requests`` and the standard library;
+      - libcurl, used by yfinance 1.7 through ``curl_cffi``. libcurl opens its sockets in C code, so
+        patching ``socket`` never sees it. Every curl request goes through ``Curl.perform``, so that
+        is patched too.
+    The fixture hands the list of recorded attempts to the test, as ("socket" or "curl", details)
+    pairs. At the end the test fails if the list is not empty.
+    """
+    from curl_cffi import curl as curl_module
+
     attempts = []
 
-    def refuse(*args, **kwargs):
-        attempts.append(args)
-        raise AssertionError("a test tried to use the network")
+    def refuse_socket(*args, **kwargs):
+        attempts.append(("socket", args))
+        raise AssertionError("a test tried to use the network (through a Python socket)")
 
-    monkeypatch.setattr(socket.socket, "connect", refuse)
-    monkeypatch.setattr(socket, "getaddrinfo", refuse)
-    monkeypatch.setattr(socket, "create_connection", refuse)
-    yield
+    def refuse_curl(self, *args, **kwargs):
+        attempts.append(("curl", None))
+        raise AssertionError("a test tried to use the network (through libcurl)")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse_socket)
+    monkeypatch.setattr(socket, "getaddrinfo", refuse_socket)
+    monkeypatch.setattr(socket, "create_connection", refuse_socket)
+    monkeypatch.setattr(curl_module.Curl, "perform", refuse_curl)
+    yield attempts
     assert attempts == []  # nothing even tried to reach the network
+
+
+# --- the guard's own tests ------------------------------------------------------
+# These aim at the LOOPBACK address on a port where nothing listens. Even if the guard were
+# broken, such a request stays on this computer (it ends in "connection refused"); it can never
+# reach Yahoo or any other server. A broken guard therefore makes the test fail, not download.
+NOTHING_LISTENS = "http://127.0.0.1:1/"
+
+
+def test_the_guard_refuses_and_records_a_libcurl_request(real_yf):
+    from curl_cffi import requests as curl_requests
+
+    with pytest.raises(AssertionError, match="libcurl"):
+        curl_requests.get(NOTHING_LISTENS, timeout=3)
+
+    # It was caught by the curl patch. The socket patches could not see it (libcurl uses its own sockets).
+    assert [kind for kind, _ in real_yf] == ["curl"]
+    real_yf.clear()  # this attempt was expected: do not let the fixture's final check fail the test
+
+
+def test_the_guard_refuses_the_session_yfinance_itself_uses(real_yf):
+    from yfinance._http import new_session  # the session that yf.download builds for its requests
+
+    with pytest.raises(AssertionError, match="libcurl"):
+        new_session().get(NOTHING_LISTENS, timeout=3)
+
+    assert [kind for kind, _ in real_yf] == ["curl"]
+    real_yf.clear()
+
+
+def test_the_guard_refuses_and_records_a_python_socket_connection(real_yf):
+    with pytest.raises(AssertionError, match="Python socket"):
+        socket.create_connection(("127.0.0.1", 1), timeout=1)
+
+    assert [kind for kind, _ in real_yf] == ["socket"]
+    real_yf.clear()
 
 
 def history_frame() -> pd.DataFrame:
