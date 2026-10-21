@@ -11,7 +11,7 @@ to test. The dashboard just calls these functions.
 The pieces:
     LimitError         -> the one error type; its message is safe to show to a visitor
     normalize_tickers  -> turn "aapl, msft ,AAPL" into ["AAPL", "MSFT"], or refuse bad symbols
-    RequestLimits      -> a bundle of the four limits (None = unlimited)
+    RequestLimits      -> a bundle of the five limits (None = unlimited)
     PUBLIC_LIMITS / LOCAL_LIMITS / active_limits -> pick the bundle from SIGNALDESK_MODE
     check_request      -> refuse a request that has too many tickers or too long a date range
     earliest_allowed_start -> the oldest start date a given end date allows (for date pickers)
@@ -125,29 +125,50 @@ def normalize_tickers(raw) -> list[str]:
 class RequestLimits:
     """A bundle of limits. ``None`` means "no limit" for that item.
 
-    max_tickers              most tickers in one request
-    max_years                longest date range in one request, in years
-    max_live_loads_per_hour  how many live (non-demo) loads one visitor may do per hour
-    max_concurrent_downloads how many downloads may run at the same moment (all visitors)
-    A limit that is set must be above zero.
+    max_tickers                  most tickers in one request
+    max_years                    longest date range in one request, in years
+    max_live_loads_per_hour      how many live (non-demo) loads ONE VISITOR may do per hour
+    max_concurrent_downloads     how many downloads may run at the same moment (all visitors)
+    max_site_live_loads_per_hour how many live loads the WHOLE SITE (all visitors together)
+                                 may do per hour
+    A limit that is set must be above zero. The fields are in this order, and the last one
+    has a default, so older code that passes only the first four values still works.
+
+    Why there are two hourly limits. The per-visitor limit is counted per browser session,
+    and a new session (a page reload, or a script that opens many sessions) starts with a
+    fresh allowance, so on its own it cannot stop a flood. Every live load goes to Yahoo
+    Finance from the ONE server address that all visitors share, and Yahoo blocks an address
+    that asks too much. A block would stop the live feature for everybody. The site-wide cap
+    counts every live load on the whole site and protects that shared address. The demo
+    portfolio is not affected: it reads the committed snapshot and never counts. Neither
+    should a cache hit: only a request that really goes out to Yahoo counts. The dashboard
+    uses a second ``RateLimiter`` for this, with the fixed key "__site__".
     """
 
     max_tickers: int | None = None
     max_years: float | None = None
     max_live_loads_per_hour: int | None = None
     max_concurrent_downloads: int | None = None
+    max_site_live_loads_per_hour: int | None = None
 
     def __post_init__(self) -> None:
-        for name in ("max_tickers", "max_years", "max_live_loads_per_hour", "max_concurrent_downloads"):
+        for name in (
+            "max_tickers",
+            "max_years",
+            "max_live_loads_per_hour",
+            "max_concurrent_downloads",
+            "max_site_live_loads_per_hour",
+        ):
             value = getattr(self, name)
             if value is not None and not value > 0:
                 raise ValueError(f"{name} must be above zero or None (unlimited), got {value!r}.")
 
 
-# The public website: strict. 10 tickers, 10 years, 10 live loads per hour, 1 download at a time.
-PUBLIC_LIMITS = RequestLimits(10, 10, 10, 1)
+# The public website: strict. 10 tickers, 10 years, 10 live loads per hour per visitor,
+# 1 download at a time, and at most 30 live loads per hour for the whole site together.
+PUBLIC_LIMITS = RequestLimits(10, 10, 10, 1, 30)
 # Your own computer: nothing is limited.
-LOCAL_LIMITS = RequestLimits(None, None, None, None)
+LOCAL_LIMITS = RequestLimits(None, None, None, None, None)
 
 MODE_VARIABLE = "SIGNALDESK_MODE"
 

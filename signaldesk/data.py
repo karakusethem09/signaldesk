@@ -79,7 +79,10 @@ class ProviderUnavailableError(PriceDataError):
     cannot tell them apart, so the message names all three: the provider is rate-limiting or
     unavailable (try again later), the symbols do not exist, or the dates contain no trading
     days (a weekend or a market holiday). It is also raised when ``yf.download`` itself
-    raises a rate-limit or network error; in that case the provider is the cause.
+    raises a rate-limit or network error; in that case the provider is the cause. A local
+    error inside yfinance on ALL the tickers (for example a ``PermissionError``, or a locked
+    sqlite cache database) gives this same error too, because yfinance swallows it and
+    reports "no data", so the message cannot tell it from a provider problem.
 
     When only SOME tickers are missing we raise a plain PriceDataError instead. That does NOT
     prove the provider is healthy: yfinance hides a rate limit (or a local error inside

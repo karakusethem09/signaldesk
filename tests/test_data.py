@@ -1364,21 +1364,46 @@ def test_load_prices_for_a_weekend_gives_the_no_trading_days_message(monkeypatch
 # W2: what REAL yfinance does with errors. These tests run the real yf.download
 # (threads, per-ticker error catching, table building) and replace only
 # Ticker.history, the one method that talks to Yahoo. Every attempt to open a
-# network connection is refused and recorded, and the test fails if there was one.
+# network connection (Python socket, libcurl, async libcurl) is refused and recorded, and
+# the test fails if there was one.
 # --------------------------------------------------------------------------- #
 
-@pytest.fixture
-def real_yf(monkeypatch):
-    """Guard for tests that run the real yf.download: refuse and record any network attempt.
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
-    There are TWO ways to reach the network and the guard needs both:
-      - Python sockets (``socket.connect`` and friends), used by ``requests`` and the standard library;
-      - libcurl, used by yfinance 1.7 through ``curl_cffi``. libcurl opens its sockets in C code, so
-        patching ``socket`` never sees it. Every curl request goes through ``Curl.perform``, so that
-        is patched too.
-    The fixture hands the list of recorded attempts to the test, as ("socket" or "curl", details)
-    pairs. At the end the test fails if the list is not empty.
+
+@pytest.fixture
+def no_proxy(monkeypatch):
+    """Tell libcurl never to use a proxy ("*" means: for every address).
+
+    Why: on a company or CI machine the environment may define HTTP_PROXY and friends. A request
+    to even the loopback address could then be sent TO THE PROXY, which is a computer elsewhere.
     """
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+
+
+def assert_proxies_are_off():
+    assert os.environ.get("NO_PROXY") == "*" and os.environ.get("no_proxy") == "*"
+
+
+def network_guard(monkeypatch):
+    """The guard behind the ``real_yf`` fixture, as a plain generator so it can be tested.
+
+    Refuses and records every attempt to reach the network, and yields the list of attempts as
+    ("socket" | "curl" | "curl-async", details) pairs. When the test is over it fails the test
+    if that list is not empty.
+
+    There are three ways out to the network and the guard needs all of them:
+      - Python sockets (``socket.connect`` and friends), used by ``requests`` and the standard library;
+      - libcurl, used by yfinance 1.7 through ``curl_cffi``. libcurl opens its own sockets in C code,
+        so patching ``socket`` never sees it. Every blocking curl request goes through ``Curl.perform``;
+      - curl_cffi's async engine, which never calls ``Curl.perform`` but ``AsyncCurl.add_handle``.
+
+    The refusal alone is NOT enough: yfinance catches every exception per ticker, so it swallows our
+    AssertionError and carries on. That is why the attempt is also recorded and the check at the
+    end is the thing that actually reports a leak.
+    """
+    from curl_cffi import aio as curl_aio
     from curl_cffi import curl as curl_module
 
     attempts = []
@@ -1391,39 +1416,70 @@ def real_yf(monkeypatch):
         attempts.append(("curl", None))
         raise AssertionError("a test tried to use the network (through libcurl)")
 
+    def refuse_curl_async(self, *args, **kwargs):
+        attempts.append(("curl-async", None))
+        raise AssertionError("a test tried to use the network (through async libcurl)")
+
     monkeypatch.setattr(socket.socket, "connect", refuse_socket)
     monkeypatch.setattr(socket, "getaddrinfo", refuse_socket)
     monkeypatch.setattr(socket, "create_connection", refuse_socket)
     monkeypatch.setattr(curl_module.Curl, "perform", refuse_curl)
+    monkeypatch.setattr(curl_aio.AsyncCurl, "add_handle", refuse_curl_async)
     yield attempts
-    assert attempts == []  # nothing even tried to reach the network
+    assert attempts == [], f"the test tried to reach the network: {[kind for kind, _ in attempts]}"
+
+
+@pytest.fixture
+def real_yf(monkeypatch, no_proxy):
+    yield from network_guard(monkeypatch)
 
 
 # --- the guard's own tests ------------------------------------------------------
-# These aim at the LOOPBACK address on a port where nothing listens. Even if the guard were
-# broken, such a request stays on this computer (it ends in "connection refused"); it can never
-# reach Yahoo or any other server. A broken guard therefore makes the test fail, not download.
+# These aim at the LOOPBACK address on a port where nothing listens, and NO_PROXY is set (see the
+# ``no_proxy`` fixture). A request like that should stay on this computer: even if the guard
+# were broken it would end in "connection refused" rather than download anything, so a broken
+# guard makes the test fail instead of reaching a server.
 NOTHING_LISTENS = "http://127.0.0.1:1/"
 
 
 def test_the_guard_refuses_and_records_a_libcurl_request(real_yf):
     from curl_cffi import requests as curl_requests
 
-    with pytest.raises(AssertionError, match="libcurl"):
+    assert_proxies_are_off()
+    with pytest.raises(AssertionError, match="through libcurl"):
         curl_requests.get(NOTHING_LISTENS, timeout=3)
 
     # It was caught by the curl patch. The socket patches could not see it (libcurl uses its own sockets).
     assert [kind for kind, _ in real_yf] == ["curl"]
-    real_yf.clear()  # this attempt was expected: do not let the fixture's final check fail the test
+    real_yf.clear()  # this attempt was expected: do not let the final check fail the test
 
 
 def test_the_guard_refuses_the_session_yfinance_itself_uses(real_yf):
     from yfinance._http import new_session  # the session that yf.download builds for its requests
 
-    with pytest.raises(AssertionError, match="libcurl"):
+    assert_proxies_are_off()
+    with pytest.raises(AssertionError, match="through libcurl"):
         new_session().get(NOTHING_LISTENS, timeout=3)
 
     assert [kind for kind, _ in real_yf] == ["curl"]
+    real_yf.clear()
+
+
+def test_the_guard_refuses_and_records_the_async_curl_engine(real_yf):
+    # curl_cffi's async engine never calls Curl.perform, so it needs its own patch.
+    import asyncio
+
+    from curl_cffi import requests as curl_requests
+
+    async def one_request():
+        async with curl_requests.AsyncSession() as session:
+            await session.get(NOTHING_LISTENS, timeout=3)
+
+    assert_proxies_are_off()
+    with pytest.raises(AssertionError, match="through async libcurl"):
+        asyncio.run(one_request())
+
+    assert [kind for kind, _ in real_yf] == ["curl-async"]
     real_yf.clear()
 
 
@@ -1433,6 +1489,80 @@ def test_the_guard_refuses_and_records_a_python_socket_connection(real_yf):
 
     assert [kind for kind, _ in real_yf] == ["socket"]
     real_yf.clear()
+
+
+def history_that_calls_libcurl(ticker):
+    """A stand-in for Ticker.history that (wrongly) goes out to the network."""
+    from curl_cffi import requests as curl_requests
+
+    curl_requests.get(NOTHING_LISTENS, timeout=3)
+    raise AssertionError("not reached: the guard refuses the request above")
+
+
+def test_a_leak_inside_yf_download_is_recorded_although_yfinance_swallows_the_error(real_yf, monkeypatch):
+    # yfinance catches EVERY exception per ticker, our refusal included, and turns it into "no
+    # data". All the test then sees is an ordinary empty-data error. The record is what proves
+    # that something tried to leave the computer.
+    patch_history(monkeypatch, history_that_calls_libcurl)
+
+    with pytest.raises(data.ProviderUnavailableError):  # the refusal vanished into "no data"
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+    assert [kind for kind, _ in real_yf] == ["curl", "curl"]  # one attempt per ticker, both recorded
+    real_yf.clear()
+
+
+def test_the_guards_final_check_fails_a_test_that_leaked_inside_yf_download(monkeypatch, no_proxy):
+    # Run the guard by hand, so that its end-of-test check can be looked at instead of failing us.
+    guard = network_guard(monkeypatch)
+    attempts = next(guard)
+    patch_history(monkeypatch, history_that_calls_libcurl)
+
+    with pytest.raises(data.ProviderUnavailableError):
+        download_prices(["AAPL"], "2026-01-01", "2026-01-10")
+    assert len(attempts) == 1
+
+    with pytest.raises(AssertionError, match=r"tried to reach the network: \['curl'\]"):
+        next(guard)  # the check at the end of a test that did not clear the list
+
+
+def test_the_guards_final_check_passes_a_clean_test(monkeypatch, no_proxy):
+    guard = network_guard(monkeypatch)
+    assert next(guard) == []
+    with pytest.raises(StopIteration):  # finished without complaint
+        next(guard)
+
+
+# NO_PROXY: not just set, but shown to work. These two tests use the REAL libcurl (no guard), against
+# loopback only: the target is 127.0.0.1:1 and the pretend proxy is 127.0.0.1:2, and nothing listens
+# on either. The error text says which of the two curl tried, so the result is exact.
+
+def test_no_proxy_keeps_libcurl_away_from_a_configured_proxy(no_proxy, monkeypatch):
+    from curl_cffi import requests as curl_requests
+
+    for variable in PROXY_VARIABLES:
+        monkeypatch.setenv(variable, "http://127.0.0.1:2")
+
+    with pytest.raises(curl_requests.exceptions.ConnectionError) as caught:
+        curl_requests.get(NOTHING_LISTENS, timeout=3)
+
+    assert "127.0.0.1:1" in str(caught.value)  # it went straight to the target...
+    assert "over proxy" not in str(caught.value)  # ...and not through the proxy
+
+
+def test_without_no_proxy_libcurl_would_use_a_configured_proxy(monkeypatch):
+    # The control for the test above: it proves that test can tell the two cases apart.
+    from curl_cffi import requests as curl_requests
+
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    for variable in PROXY_VARIABLES:
+        monkeypatch.setenv(variable, "http://127.0.0.1:2")
+
+    with pytest.raises(curl_requests.exceptions.ConnectionError) as caught:
+        curl_requests.get(NOTHING_LISTENS, timeout=3)
+
+    assert "over proxy" in str(caught.value) and "127.0.0.1:2" in str(caught.value)
 
 
 def history_frame() -> pd.DataFrame:
@@ -1543,6 +1673,26 @@ def test_a_local_error_inside_yfinance_also_surfaces_as_missing_data(real_yf, mo
     patch_history(monkeypatch, always_locked)
     with pytest.raises(data.ProviderUnavailableError):
         download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError("cannot open yfinance cache"), sqlite3.OperationalError("database is locked")],
+    ids=["PermissionError", "locked sqlite cache"],
+)
+def test_a_local_error_inside_yfinance_on_every_ticker_gives_provider_unavailable(real_yf, monkeypatch, error):
+    def fail(ticker):
+        raise error
+
+    patch_history(monkeypatch, fail)
+    with pytest.raises(data.ProviderUnavailableError):
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+
+def test_the_provider_unavailable_docstring_says_a_local_yfinance_error_gives_it_too():
+    first_paragraph = data.ProviderUnavailableError.__doc__.split("\n\n")[1]  # (after the one-line summary)
+    assert "local" in first_paragraph and "PermissionError" in first_paragraph
+    assert "sqlite" in first_paragraph and "ALL the tickers" in first_paragraph
 
 
 def test_real_download_of_a_weekend_is_the_no_trading_days_message(real_yf, monkeypatch):

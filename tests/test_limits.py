@@ -6,7 +6,7 @@ can be checked with a pencil.
 
 import threading
 import time
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from datetime import date, datetime
 
 import pandas as pd
@@ -136,14 +136,52 @@ def test_normalize_rejects_things_that_are_not_text(not_text):
 # --------------------------------------------------------------------------- #
 
 def test_presets_have_the_agreed_values():
-    assert PUBLIC_LIMITS == RequestLimits(10, 10, 10, 1)
+    assert PUBLIC_LIMITS == RequestLimits(10, 10, 10, 1, 30)
     assert (
         PUBLIC_LIMITS.max_tickers,
         PUBLIC_LIMITS.max_years,
         PUBLIC_LIMITS.max_live_loads_per_hour,
         PUBLIC_LIMITS.max_concurrent_downloads,
-    ) == (10, 10, 10, 1)
-    assert LOCAL_LIMITS == RequestLimits(None, None, None, None)
+        PUBLIC_LIMITS.max_site_live_loads_per_hour,
+    ) == (10, 10, 10, 1, 30)
+    assert LOCAL_LIMITS == RequestLimits(None, None, None, None, None)
+
+
+def test_the_site_wide_live_load_limit_defaults_to_none():
+    assert RequestLimits().max_site_live_loads_per_hour is None
+    assert RequestLimits(max_tickers=5).max_site_live_loads_per_hour is None
+    assert RequestLimits(10, 10, 10, 1).max_site_live_loads_per_hour is None
+
+
+def test_the_public_preset_caps_the_whole_site_at_30_live_loads_an_hour():
+    assert PUBLIC_LIMITS.max_site_live_loads_per_hour == 30
+    # the site cap is larger than one visitor's own budget, and it is a separate field
+    assert PUBLIC_LIMITS.max_site_live_loads_per_hour > PUBLIC_LIMITS.max_live_loads_per_hour
+
+
+def test_the_local_preset_has_no_site_wide_limit():
+    assert LOCAL_LIMITS.max_site_live_loads_per_hour is None
+    assert all(value is None for value in vars(LOCAL_LIMITS).values())  # every limit is off
+
+
+def test_request_limits_still_accepts_the_old_four_positional_values():
+    old_style = RequestLimits(10, 10, 2, 1)  # how code written before the fifth field builds one
+    assert (old_style.max_tickers, old_style.max_years) == (10, 10)
+    assert (old_style.max_live_loads_per_hour, old_style.max_concurrent_downloads) == (2, 1)
+    assert old_style.max_site_live_loads_per_hour is None
+    assert old_style != PUBLIC_LIMITS  # the fifth value is what tells them apart
+
+
+def test_request_limits_fifth_positional_value_is_the_site_wide_limit():
+    assert RequestLimits(1, 2, 3, 4, 5).max_site_live_loads_per_hour == 5
+    assert RequestLimits(max_site_live_loads_per_hour=7) == RequestLimits(None, None, None, None, 7)
+    assert [f.name for f in fields(RequestLimits)] == [
+        "max_tickers",
+        "max_years",
+        "max_live_loads_per_hour",
+        "max_concurrent_downloads",
+        "max_site_live_loads_per_hour",
+    ]
 
 
 def test_request_limits_is_frozen():
@@ -151,7 +189,16 @@ def test_request_limits_is_frozen():
         PUBLIC_LIMITS.max_tickers = 99
 
 
-@pytest.mark.parametrize("field", ["max_tickers", "max_years", "max_live_loads_per_hour", "max_concurrent_downloads"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_tickers",
+        "max_years",
+        "max_live_loads_per_hour",
+        "max_concurrent_downloads",
+        "max_site_live_loads_per_hour",
+    ],
+)
 @pytest.mark.parametrize("bad", [0, -1, float("nan")])
 def test_request_limits_rejects_a_set_limit_that_is_not_above_zero(field, bad):
     with pytest.raises(ValueError, match=field):
