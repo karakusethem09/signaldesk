@@ -1,0 +1,4 @@
+# Everything the app needs, plus the tools to test it.
+# Install with: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest==9.1.1
