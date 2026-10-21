@@ -1565,6 +1565,8 @@ def test_the_prices_guard_limit_is_documented():
 # =========================================================================== #
 
 import inspect  # noqa: E402  (appended section: the imports sit next to the tests that use them)
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 from signaldesk import data  # noqa: E402
 from signaldesk.risk import (  # noqa: E402
@@ -1897,9 +1899,10 @@ def test_portfolio_value_clean_data_and_ignored_gaps_do_not_warn():
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # ANY warning fails the test
         portfolio_value(clean_random_prices(120), {"A": 0.2, "B": 0.5, "C": 0.3})
-        # a gap in a zero-weight ticker, and a leading gap before the common start, are not valued at all
-        prices = make_frame({"A": [NAN, 100, 101, 102], "B": [50, 51, 52, 53], "C": [1, NAN, NAN, 4]})
+        # gaps (and a late start) in a ZERO-weight ticker are not valued at all, and move nothing
+        prices = make_frame({"A": [100, 101, 102, 103], "B": [50, 51, 52, 53], "C": [NAN, NAN, 3, 4]})
         portfolio_value(prices, {"A": 0.5, "B": 0.5, "C": 0.0})
+        # (a leading gap in a HELD ticker does warn: see the shorter-history tests below)
 
 
 # --------------------------------------------------------------------------- #
@@ -2151,6 +2154,13 @@ def test_return_correlation_needs_two_columns_and_valid_prices():
         return_correlation(long_prices()["AAPL"])
     with pytest.raises(ValueError, match="at least 2 columns"):
         return_correlation(long_prices()[["AAPL"]])
+    # the error speaks in return_correlation's own name, not correlation_matrix's
+    for one_ticker, wording in ((long_prices()["AAPL"], "got a Series"), (long_prices()[["AAPL"]], "got only one column")):
+        with pytest.raises(ValueError, match=r"^return_correlation needs at least 2 tickers") as caught:
+            return_correlation(one_ticker)
+        assert "correlation_matrix" not in str(caught.value) and wording in str(caught.value)
+    with pytest.raises(ValueError, match="pandas"):  # other bad input still gets the usual message
+        return_correlation([1.0, 2.0])
     with pytest.raises(ValueError, match="greater than 0"):
         return_correlation(make_frame({"A": [100, 0.0, 110], "B": [50, 51, 52]}))
     prices = long_prices()
@@ -2200,7 +2210,10 @@ def test_demo_portfolio_value_starts_at_one_and_covers_the_whole_snapshot(demo):
     value = portfolio_value(demo.prices, demo.holdings)
     assert value.name == "Portfolio" and value.dtype == "float64"
     assert value.iloc[0] == 1.0
-    assert len(value) == len(demo.prices) == 1254
+    # the row count comes from the snapshot's own metadata, so a refresh of the snapshot cannot break this test
+    meta_file = Path(data.__file__).resolve().parent.parent / "data" / "demo" / "demo_meta.json"
+    expected_rows = json.loads(meta_file.read_text(encoding="utf-8"))["rows"]
+    assert len(value) == len(demo.prices) == expected_rows
     assert value.index.equals(demo.prices.index)  # no NaN in the snapshot, so the start is the first row
     assert value.notna().all() and (value > 0).all()
 
@@ -2211,7 +2224,7 @@ def test_demo_portfolio_final_value_matches_an_independent_numpy_calculation(dem
     weights = np.array([demo.holdings[t] for t in tickers])
     p = demo.prices[tickers].to_numpy()
     assert abs(value.iloc[-1] - float(np.sum(weights * p[-1] / p[0]))) < 1e-12
-    middle = 600
+    middle = len(demo.prices) // 2
     assert abs(value.iloc[middle] - float(np.sum(weights * p[middle] / p[0]))) < 1e-12
     # buy and hold, not daily rebalancing: the two differ by a lot over five years
     rebalanced = float((1.0 + (daily_returns(demo.prices[tickers]) * weights).sum(axis=1)).cumprod().iloc[-1])
@@ -2254,3 +2267,95 @@ def test_demo_chart_functions_equal_the_two_step_calls_and_do_not_warn(demo):
     pd.testing.assert_frame_equal(corr, correlation_matrix(returns), check_exact=True)
     assert rolling.shape == returns.shape and rolling.iloc[58].isna().all() and rolling.iloc[59].notna().all()
     assert list(corr.columns) == list(demo.prices.columns)
+
+
+# --------------------------------------------------------------------------- #
+# portfolio_value: a late-starting holding must not silently shorten the history (polish round)
+# --------------------------------------------------------------------------- #
+
+def late_nvda_prices(demo) -> tuple[pd.DataFrame, int]:
+    """A COPY of the demo prices with NVDA missing for the first 80% of the rows (the reviewer's scenario)."""
+    prices = demo.prices.copy()
+    late = (4 * len(prices)) // 5  # 1003 of 1254 rows
+    prices.iloc[:late, prices.columns.get_loc("NVDA")] = np.nan
+    return prices, late
+
+
+def test_a_late_starting_holding_warns_with_the_ticker_the_dropped_rows_and_dates(demo):
+    prices, late = late_nvda_prices(demo)
+    before = prices.copy()
+    messages = messages_of(ShortSampleWarning, portfolio_value, prices, demo.holdings)
+    assert len(messages) == 1  # ONE warning, and it is the only sample-period warning
+    message = messages[0]
+    first, last_dropped, start, last = (f"{prices.index[i]:%Y-%m-%d}" for i in (0, late - 1, late, -1))
+    assert message.startswith("portfolio_value:")
+    assert "'NVDA' (no price on " + str(late) + " of the dropped rows)" in message  # the ticker that moved the start
+    for other in ("AAPL", "MSFT", "JPM", "XOM", "JNJ", "SPY"):
+        assert other not in message
+    assert f"{late} rows of {len(prices)} ({first} to {last_dropped})" in message  # how many, and which dates, were dropped
+    assert f"starts on {start}" in message and f"not on the first date of prices ({first})" in message
+    assert f"covers {len(prices) - late} rows ({start} to {last})" in message
+    assert "must use the same dates" in message
+    # the numbers: the portfolio really is that short (the reviewer saw 254 of 1254 rows)
+    with pytest.warns(ShortSampleWarning):
+        value = portfolio_value(prices, demo.holdings)
+    assert len(value) == len(prices) - late and value.index[0] == prices.index[late] and value.iloc[0] == 1.0
+    pd.testing.assert_frame_equal(prices, before)  # the caller's table is untouched
+
+
+def test_the_shorter_history_warning_names_only_the_tickers_that_moved_the_start():
+    # A starts on row 2, B on row 4, C on row 0: B is what decides the start (row 4). Taking A away would not help.
+    prices = make_frame({"A": [NAN, NAN, 10, 11, 12, 13], "B": [NAN, NAN, NAN, NAN, 20, 22], "C": [5, 5, 6, 6, 7, 7]})
+    message = messages_of(ShortSampleWarning, portfolio_value, prices, {"A": 0.3, "B": 0.3, "C": 0.4})[0]
+    assert "'B' (no price on 4 of the dropped rows)" in message
+    assert "'A'" not in message and "'C'" not in message
+    assert f"4 rows of 6 ({prices.index[0]:%Y-%m-%d} to {prices.index[3]:%Y-%m-%d})" in message
+    # two tickers that start together are both named
+    both = make_frame({"A": [NAN, NAN, 10, 11], "B": [NAN, NAN, 20, 22], "C": [5, 5, 6, 6]})
+    message = messages_of(ShortSampleWarning, portfolio_value, both, {"A": 0.3, "B": 0.3, "C": 0.4})[0]
+    assert "'A' (no price on 2 of the dropped rows)" in message and "'B' (no price on 2 of the dropped rows)" in message
+    # a gap in the middle that pushes the start back counts too (A: NaN, 100, 100, 110   B: 50, NaN, 40, 44 -> start row 2)
+    gap = make_frame({"A": [NAN, 100, 100, 110], "B": [50, NAN, 40, 44]})
+    message = messages_of(ShortSampleWarning, portfolio_value, gap, half_half())[0]
+    assert "'B' (no price on 1 of the dropped rows)" in message and "'A'" not in message
+    assert "2 rows of 4" in message
+
+
+def test_no_shorter_history_warning_when_every_holding_starts_on_the_first_row(demo):
+    # nothing at all may be raised as a ShortSampleWarning: the demo, clean data, gaps AFTER the start,
+    # and a zero-weight ticker that starts late
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ShortSampleWarning)
+        portfolio_value(demo.prices, demo.holdings)
+        portfolio_value(clean_random_prices(120), {"A": 0.2, "B": 0.5, "C": 0.3})
+        portfolio_value(make_frame({"A": [100, 110, 121], "B": [50, NAN, 60]}), half_half())  # only a GapWarning
+        late_zero = make_frame({"A": [100, 101, 102, 103], "B": [50, 51, 52, 53], "C": [NAN, NAN, 3, 4]})
+        portfolio_value(late_zero, {"A": 0.5, "B": 0.5, "C": 0.0})
+    assert messages_of(ShortSampleWarning, portfolio_value, demo.prices, demo.holdings) == []
+
+
+def test_the_shorter_history_warning_points_at_the_caller(demo):
+    prices, _ = late_nvda_prices(demo)
+    with pytest.warns(ShortSampleWarning, match="starts on") as record:
+        portfolio_value(prices, demo.holdings)
+    assert [w.filename for w in record] == [__file__]
+
+
+def test_the_shorter_history_warning_comes_with_the_value_not_instead_of_it():
+    # still a warning, never an error: the late-starter table gives the same numbers as before
+    prices = make_frame({"A": [100, 110, 121, 133.1], "B": [NAN, NAN, 20, 22]})
+    with pytest.warns(ShortSampleWarning, match=r"'B' \(no price on 2 of the dropped rows\)"):
+        value = portfolio_value(prices, half_half())
+    assert value.tolist() == pytest.approx([1.0, 1.10], abs=1e-12)  # same as the late-starter test above
+    assert issubclass(ShortSampleWarning, UserWarning) and "ShortSampleWarning" in risk.__all__
+
+
+# --------------------------------------------------------------------------- #
+# Cosmetic exports
+# --------------------------------------------------------------------------- #
+
+def test_portfolio_name_is_exported():
+    assert "PORTFOLIO_NAME" in risk.__all__ and risk.PORTFOLIO_NAME == "Portfolio"
+    assert portfolio_value(GOOD_PRICES, half_half()).name == risk.PORTFOLIO_NAME
+    for name in risk.__all__:  # every exported name really exists
+        assert hasattr(risk, name)

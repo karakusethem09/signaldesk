@@ -80,7 +80,9 @@ Portfolios (``portfolio_value``)
     ``portfolio_value`` turns holdings and weights into ONE price-like series named
     "Portfolio" (it starts at 1.0), so every function above works on it unchanged. It is
     BUY-AND-HOLD: the weights apply on day one only and are never rebalanced. See its
-    docstring for how the start date and missing prices are handled.
+    docstring for how the start date and missing prices are handled. If a late-starting
+    holding makes the portfolio start after the first row of the table, a ``ShortSampleWarning``
+    names it and the dropped dates: compare the portfolio with a benchmark on the same dates.
 """
 
 from __future__ import annotations
@@ -98,6 +100,7 @@ __all__ = [
     "MAX_HOLIDAY_GAP_ROWS",
     "MIN_RELIABLE_WINDOW",
     "MIN_TAIL_OBS",
+    "PORTFOLIO_NAME",
     "TRADING_DAYS_PER_YEAR",
     "GapWarning",
     "ShortSampleWarning",
@@ -150,7 +153,8 @@ class ShortSampleWarning(UserWarning):
     """Emitted when a number is based on too few observations to be trusted.
 
     It is only a warning: the number is still returned. Catch it (``pytest.warns`` or
-    ``warnings.catch_warnings``) to find out which result is shaky.
+    ``warnings.catch_warnings``) to find out which result is shaky. ``portfolio_value`` also uses
+    it when a late-starting holding makes the portfolio cover a shorter period than the table.
     """
 
 
@@ -907,6 +911,33 @@ def _run_lengths(flags: np.ndarray) -> list[int]:
     return [int(n) for n in edges[1::2] - edges[0::2]]
 
 
+def _warn_shortened_history(caller: str, frame: pd.DataFrame, start: int) -> None:
+    """Emit ONE ShortSampleWarning when the portfolio starts later than the first row of the table.
+
+    ``frame`` is the held prices BEFORE trimming and ``start`` is the position of the first
+    row where every holding has a price. Nothing is emitted when ``start`` is 0. The tickers
+    named are the ones that moved the start: those with no price on the last dropped row
+    (take them away and the portfolio could start at least one row earlier). Each is shown with
+    how many of the dropped rows it is missing on. Same ``stacklevel`` rule as ``_warn_gaps``.
+    """
+    if start == 0:
+        return
+    dropped = frame.iloc[:start]
+    blockers = frame.columns[frame.iloc[start - 1].isna().to_numpy()]
+    detail = ", ".join(f"{label!r} (no price on {int(dropped[label].isna().sum())} of the dropped rows)" for label in blockers)
+    first, last_dropped, new_start, last = (_date_text(frame.index[i]) for i in (0, start - 1, start, -1))
+    warnings.warn(
+        f"{caller}: the portfolio starts on {new_start}, not on the first date of prices ({first}). "
+        f"Dropped because not every holding had a price yet: {_rows(start)} of {len(frame)} "
+        f"({first} to {last_dropped}). The start was moved by {detail}. The portfolio covers {_rows(len(frame) - start)} "
+        f"({new_start} to {last}), a shorter period than the table. Any comparison with another series "
+        "(a benchmark, for example) must use the same dates, otherwise the two sets of numbers describe "
+        "different periods.",
+        ShortSampleWarning,
+        stacklevel=3,
+    )
+
+
 def _warn_valued_at_last_price(caller: str, frame: pd.DataFrame) -> None:
     """Emit ONE GapWarning for holdings that were valued at a last known price. Same ``stacklevel`` rule.
 
@@ -983,6 +1014,13 @@ def portfolio_value(prices, weights):
     start of the whole portfolio. If no such date exists, or fewer than 2 dates remain from
     it, ValueError.
 
+    SHORTER HISTORY WARNING: when the start date is later than the first row of ``prices``,
+    ONE ``ShortSampleWarning`` says so. It names the ticker(s) that moved the start (those with
+    no price on the last dropped row), how many rows were dropped and from which date to which
+    date, and that any comparison with another series (a benchmark) must use the same dates.
+    Without it a late starter would silently make the portfolio cover a shorter period than the
+    benchmark next to it. No warning when the portfolio starts on the first row.
+
     Missing prices after the start (an exchange holiday, an outage): the holding is valued at
     its LAST VALID PRICE on that date. This is valuation (marking to the last known price),
     not an invented return: you cannot trade a closed market, so what you own is worth what
@@ -1002,8 +1040,9 @@ def portfolio_value(prices, weights):
     that is not a DataFrame, empty or malformed; empty weights; a ticker that is not in
     ``prices`` (even with weight 0, because it is probably a typo); a non-numeric, NaN or
     infinite weight; a negative weight; weights that do not add up to 1; a held price of zero
-    or less; an index not in increasing order. No sample-size warning: it is a path, not an
-    estimate.
+    or less; an index not in increasing order. No warning about the number of observations
+    (it is a path, not an estimate); the only sample-period warning is the shorter-history one
+    above.
     """
     if not isinstance(prices, pd.DataFrame):
         raise ValueError(
@@ -1041,7 +1080,7 @@ def portfolio_value(prices, weights):
             f"portfolio has no start date. Dates with prices: {'; '.join(firsts)}."
         )
     start = int(np.argmax(complete))
-    frame = frame.iloc[start:]
+    full, frame = frame, frame.iloc[start:]
     if len(frame) < 2:
         raise ValueError(
             f"portfolio_value: need at least 2 dates from the start date {_date_text(frame.index[0])} "
@@ -1057,6 +1096,7 @@ def portfolio_value(prices, weights):
     # raw[0] is the sum of the weights: 1 up to float noise. Dividing by it makes the start exactly 1.0.
     value = raw / raw[0]
 
+    _warn_shortened_history("portfolio_value", full, start)
     _warn_valued_at_last_price("portfolio_value", frame)
     return pd.Series(value, index=frame.index, name=PORTFOLIO_NAME, dtype="float64")
 
@@ -1123,7 +1163,13 @@ def return_correlation(prices):
     (median absolute return above 0.5, such as GME in January 2021), which made the
     correlation chart vanish for every ticker. Here the returns are computed inside, so they
     are known to be returns and that heuristic is skipped (the same reasoning as in
-    ``risk_summary``). Needs at least 2 columns, like ``correlation_matrix``.
+    ``risk_summary``). Needs at least 2 columns (tickers): a Series or a 1-column table raises
+    ValueError in this function's own name.
     """
+    if isinstance(prices, pd.Series) or (isinstance(prices, pd.DataFrame) and prices.shape[1] < 2):
+        raise ValueError(
+            "return_correlation needs at least 2 tickers (a DataFrame with at least 2 columns), "
+            f"got {'a Series' if isinstance(prices, pd.Series) else 'only one column'}."
+        )
     returns = daily_returns(prices)
     return correlation_matrix(returns, _skip_prices_check=True)
