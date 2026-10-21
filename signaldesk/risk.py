@@ -71,6 +71,16 @@ Prices versus returns
     This is only a HEURISTIC for typical stock prices (tens or hundreds of dollars). It
     cannot catch a price series that stays below about 0.5 (penny stocks, some crypto
     tokens), and the same price series would be mistaken for returns there.
+    The guard can also refuse real returns: a squeeze like GME in January 2021 (+18%, +93%,
+    +135%) has a median absolute return above 0.5. ``rolling_volatility`` and
+    ``return_correlation`` take PRICES, compute the returns themselves (so they know they
+    are returns) and skip the guard, like ``risk_summary`` does. Use them for charts.
+
+Portfolios (``portfolio_value``)
+    ``portfolio_value`` turns holdings and weights into ONE price-like series named
+    "Portfolio" (it starts at 1.0), so every function above works on it unchanged. It is
+    BUY-AND-HOLD: the weights apply on day one only and are never rebalanced. See its
+    docstring for how the start date and missing prices are handled.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ from __future__ import annotations
 import math
 import numbers
 import warnings
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -96,9 +107,13 @@ __all__ = [
     "correlation_matrix",
     "cumulative_returns",
     "daily_returns",
+    "drawdown_series",
     "historical_var",
     "max_drawdown",
+    "portfolio_value",
+    "return_correlation",
     "risk_summary",
+    "rolling_volatility",
     "sharpe_ratio",
 ]
 
@@ -553,7 +568,7 @@ def annualized_volatility(returns, window=None, *, _skip_prices_check=False):
     return _finish_series(rolling * _SQRT_TRADING_DAYS, returns, is_series)
 
 
-def correlation_matrix(returns):
+def correlation_matrix(returns, *, _skip_prices_check=False):
     """Pearson correlation between the tickers' returns: do they move together?
 
     Formula: ``corr(a, b) = cov(a, b) / (std(a) * std(b))`` for every pair of columns.
@@ -571,8 +586,11 @@ def correlation_matrix(returns):
     whole row and column including the diagonal.
     Warns (ShortSampleWarning, one warning listing the pairs) if any pair shares fewer
     than ``MIN_RELIABLE_OBS`` dates.
+
+    (``_skip_prices_check`` is private, used only by ``return_correlation``, which knows its
+    input really is returns. Do not pass it.)
     """
-    frame, is_series = _prepare(returns, "returns", expect_returns=True)
+    frame, is_series = _prepare(returns, "returns", expect_returns=not _skip_prices_check)
     if is_series or frame.shape[1] < 2:
         raise ValueError(
             "correlation_matrix needs a DataFrame with at least 2 columns (tickers), "
@@ -828,3 +846,284 @@ def risk_summary(prices, confidence=0.95, risk_free_rate=0.0):
     _warn_short_sample("risk_summary", n_obs.loc[calculated], "returns")
     _warn_thin_tail("risk_summary", n_obs.loc[calculated], level)
     return summary
+
+
+# --------------------------------------------------------------------------- #
+# Portfolio and chart functions (Phase 1.5). Added next to the ones above; nothing above changed.
+# --------------------------------------------------------------------------- #
+
+#: The weights of a portfolio must add up to 1 within this much (float noise, not a rounding excuse).
+_WEIGHT_SUM_TOLERANCE = 1e-9
+
+#: The name of the series ``portfolio_value`` returns.
+PORTFOLIO_NAME = "Portfolio"
+
+
+def _date_text(label) -> str:
+    """A date label as ``2026-01-31`` (or plain text for an index that is not dates)."""
+    return label.strftime("%Y-%m-%d") if hasattr(label, "strftime") else str(label)
+
+
+def _clean_weights(weights) -> dict:
+    """Check a ``{ticker: weight}`` mapping and return it as a NEW dict of floats.
+
+    Raises ValueError (naming the problem) for: not a dict / Series, empty, a ticker listed
+    twice, a weight that is not a finite real number, a negative weight, or weights that
+    do not add up to 1 within ``_WEIGHT_SUM_TOLERANCE``. A weight of exactly 0 is fine.
+    """
+    if isinstance(weights, pd.Series):
+        if weights.index.has_duplicates:
+            raise ValueError("portfolio_value: weights lists the same ticker more than once.")
+        items = list(weights.items())
+    elif isinstance(weights, Mapping):
+        items = list(weights.items())
+    else:
+        raise ValueError(
+            "portfolio_value: weights must be a dict or a pandas Series mapping ticker -> weight, "
+            f"got {type(weights).__name__}."
+        )
+    if not items:
+        raise ValueError("portfolio_value: weights is empty; a portfolio needs at least one holding.")
+
+    cleaned = {ticker: _real_number(weight, f"portfolio_value: the weight of {ticker!r}") for ticker, weight in items}
+    negative = [ticker for ticker, weight in cleaned.items() if weight < 0.0]
+    if negative:
+        detail = ", ".join(f"{ticker!r}: {cleaned[ticker]:g}" for ticker in negative)
+        raise ValueError(
+            f"portfolio_value: negative weights are not supported ({detail}). Only long positions "
+            "for now, so every weight must be 0 or more."
+        )
+    total = math.fsum(cleaned.values())
+    if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
+        raise ValueError(
+            f"portfolio_value: the weights must add up to 1 (100%), but they add up to {total:.12g}."
+        )
+    return cleaned
+
+
+def _run_lengths(flags: np.ndarray) -> list[int]:
+    """Lengths of the runs of consecutive True values, in order. ``[F, T, T, F, T]`` gives ``[2, 1]``."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], flags.astype(np.int8), [0]])))
+    return [int(n) for n in edges[1::2] - edges[0::2]]
+
+
+def _warn_valued_at_last_price(caller: str, frame: pd.DataFrame) -> None:
+    """Emit ONE GapWarning for holdings that were valued at a last known price. Same ``stacklevel`` rule.
+
+    ``frame`` is the held prices from the common start date on (so its first row is complete).
+    Each ticker is shown as ``'AAPL': 19 valued at last price (longest 1 row)``. Two stronger
+    sentences can follow: a run longer than ``MAX_HOLIDAY_GAP_ROWS`` rows (longer than any
+    holiday, so probably missing data), and a STALE holding, whose last valid price is before
+    the last date of the table (stopped trading, delisted, or its data ends early).
+    """
+    missing = frame.isna().to_numpy()
+    detail, long_ones, stale = [], [], []
+    for position, label in enumerate(frame.columns):
+        flags = missing[:, position]
+        count = int(flags.sum())
+        if count == 0:
+            continue
+        runs = _run_lengths(flags)
+        detail.append(f"{label!r}: {count} valued at last price (longest {_rows(max(runs))})")
+        if max(runs) > MAX_HOLIDAY_GAP_ROWS:
+            long_ones.append(f"{label!r} ({_rows(max(runs))})")
+        if flags[-1]:  # the last run reaches the end of the table: no price after some date
+            last_valid = frame.index[~flags][-1]
+            stale.append(f"{label!r} has no price after {_date_text(last_valid)} ({_rows(runs[-1])} to the end of the table)")
+    if not detail:
+        return
+    message = (
+        f"{caller}: some dates were valued at a last known price because a holding had no price "
+        f"that day ({', '.join(detail)}). That is valuation (the holding keeps its last price until "
+        "it trades again), not an invented return. Short runs (a few rows) are normal for exchange "
+        "holidays when tickers from different exchanges share a table; otherwise it means missing "
+        "data (see data.find_gaps)."
+    )
+    if long_ones:
+        message += (
+            f" A run of more than {MAX_HOLIDAY_GAP_ROWS} rows is longer than a holiday: {', '.join(long_ones)}. "
+            "This is likely missing data."
+        )
+    if stale:
+        message += (
+            f" Stale holding: {'; '.join(stale)}. It stays at that last price until the end, so the "
+            "portfolio ignores whatever happened to it afterwards (a delisting, for example)."
+        )
+    warnings.warn(message, GapWarning, stacklevel=3)
+
+
+def portfolio_value(prices, weights):
+    """Value of 1 unit invested in a portfolio, BUY-AND-HOLD (NO rebalancing): a price-like series.
+
+    BUY-AND-HOLD, NO REBALANCING. The weights are applied ONCE, on the first day: a fraction
+    ``w_i`` of the money is used to buy holding ``i`` and nothing is ever bought or sold again.
+    A winner therefore grows to a bigger share of the portfolio over time. Why this choice:
+    it is the simplest to explain, and it is exactly the "growth of $1" a reader expects.
+    A rebalanced portfolio (back to the target weights every day or month) would give a
+    different curve, and this function does NOT do that.
+
+    Formula: ``V_t = sum_i( w_i * P_i,t / P_i,start )``, where ``P_i,start`` is the price of
+    holding ``i`` on the start date. ``V`` starts at exactly 1.0 (1.12 means +12% since the
+    start). Units: a multiple of the starting value, not a percent. Because it is price-like,
+    ``risk_summary``, ``max_drawdown``, ``drawdown_series`` and the others take it directly,
+    for example ``risk_summary(pd.DataFrame({"Portfolio": value}))``.
+
+    Inputs
+        prices   a DataFrame of adjusted closes, one column per ticker, oldest first (like the
+                 table from ``data.load_prices``). Extra columns (the benchmark) are ignored.
+        weights  a dict or Series ``{ticker: weight}`` of fractions (0.20 = 20%). Every ticker
+                 must be a column of ``prices``. Weights must be finite numbers, 0 or more
+                 (long-only for now), and add up to 1 within 1e-9 (any tiny float noise is
+                 divided out so the series starts at exactly 1.0). A weight of 0 is allowed:
+                 that ticker simply does not count (it can even have bad prices).
+
+    Start date: the FIRST date on which EVERY held ticker (weight above 0) has a valid price.
+    Rows before it are dropped, so the result can be shorter than ``prices``. Nothing is ever
+    filled in before the start date. A holding that starts trading later therefore moves the
+    start of the whole portfolio. If no such date exists, or fewer than 2 dates remain from
+    it, ValueError.
+
+    Missing prices after the start (an exchange holiday, an outage): the holding is valued at
+    its LAST VALID PRICE on that date. This is valuation (marking to the last known price),
+    not an invented return: you cannot trade a closed market, so what you own is worth what
+    it was last worth. It differs from the gap policy of ``daily_returns``. That function
+    works on ONE ticker, so on a gap day it says "no return known" (NaN) and measures the next
+    price against the last valid one. A portfolio is different: its other holdings DO trade
+    that day, so the portfolio has a value and a return on that date. The closed holding just
+    stays flat, and its whole move lands on the day it trades again (the same bridged move
+    ``daily_returns`` would see, only spread differently across tickers). ONE ``GapWarning``
+    names each ticker and how many dates were valued this way, and it says more if a run is
+    longer than ``MAX_HOLIDAY_GAP_ROWS`` rows or if a holding is STALE (its last valid price
+    is before the last date of the table: stopped trading or delisted, so it is held flat to
+    the end).
+
+    Output: a float64 Series named "Portfolio" on the dates from the start date on (the
+    index keeps its type and name). The inputs are never modified. ValueError for: ``prices``
+    that is not a DataFrame, empty or malformed; empty weights; a ticker that is not in
+    ``prices`` (even with weight 0, because it is probably a typo); a non-numeric, NaN or
+    infinite weight; a negative weight; weights that do not add up to 1; a held price of zero
+    or less; an index not in increasing order. No sample-size warning: it is a path, not an
+    estimate.
+    """
+    if not isinstance(prices, pd.DataFrame):
+        raise ValueError(
+            "portfolio_value: prices must be a pandas DataFrame with one column per ticker "
+            f"(like the table from data.load_prices), got {type(prices).__name__}."
+        )
+    cleaned = _clean_weights(weights)
+    if prices.columns.has_duplicates:
+        raise ValueError("prices has duplicate column names; every ticker must appear once.")
+    unknown = [ticker for ticker in cleaned if ticker not in prices.columns]
+    if unknown:
+        raise ValueError(
+            f"portfolio_value: weights name tickers that are not in prices: "
+            f"{', '.join(repr(t) for t in unknown)}. The columns of prices are "
+            f"{', '.join(repr(c) for c in prices.columns)}."
+        )
+
+    # Only the HELD columns are looked at (weight above 0), in the column order of `prices`, so
+    # the result depends neither on the order of the weights nor on the tickers that are not held.
+    held = [column for column in prices.columns if cleaned.get(column, 0.0) > 0.0]
+    frame, _ = _prepare(prices[held], "prices", ordered=True, positive=True)
+
+    # Start date: the first row where every held ticker has a price.
+    complete = frame.notna().all(axis=1).to_numpy()
+    if not complete.any():
+        firsts = []
+        for label in frame.columns:
+            valid = frame[label].dropna()
+            firsts.append(
+                f"{label!r}: no valid price" if valid.empty
+                else f"{label!r}: {_date_text(valid.index[0])} to {_date_text(valid.index[-1])}"
+            )
+        raise ValueError(
+            "portfolio_value: there is no date on which every holding has a price, so the "
+            f"portfolio has no start date. Dates with prices: {'; '.join(firsts)}."
+        )
+    start = int(np.argmax(complete))
+    frame = frame.iloc[start:]
+    if len(frame) < 2:
+        raise ValueError(
+            f"portfolio_value: need at least 2 dates from the start date {_date_text(frame.index[0])} "
+            f"(the first date on which every holding has a price), but only {len(frame)} remain."
+        )
+
+    # Mark to the last known price. The first row is complete, so ffill leaves no NaN, and it
+    # can only look BACKWARDS in time, from the start date on: nothing before the start is filled.
+    marked = frame.ffill()
+    growth = marked.to_numpy() / marked.to_numpy()[0]  # every holding starts at exactly 1.0
+    w = np.array([cleaned[column] for column in marked.columns], dtype="float64")
+    raw = (growth * w).sum(axis=1)
+    # raw[0] is the sum of the weights: 1 up to float noise. Dividing by it makes the start exactly 1.0.
+    value = raw / raw[0]
+
+    _warn_valued_at_last_price("portfolio_value", frame)
+    return pd.Series(value, index=frame.index, name=PORTFOLIO_NAME, dtype="float64")
+
+
+def drawdown_series(prices):
+    """The "underwater" curve: how far below its previous peak the price is on every day.
+
+    Formula: ``d_t = 1 - P_t / running_max(P)_t``, where ``running_max`` is the highest price
+    seen UP TO day t (not over the whole series). It is the same quantity ``max_drawdown``
+    takes the maximum of: ``drawdown_series(p).max()`` equals ``max_drawdown(p)``, exactly.
+
+    SIGN and units: a POSITIVE fraction between 0 and 1 (0.25 means "25% below the earlier
+    peak"), like ``max_drawdown`` and ``historical_var``. It is 0 on a day that sets a new
+    peak (or equals it). Example: prices [100, 120, 90, 130] give [0, 0, 0.25, 0].
+
+    Shapes: a Series gives a Series (same name), a DataFrame gives a DataFrame (one curve
+    per column), on the same dates as the input.
+
+    Gaps: it is NaN where the price is NaN, and before a column's first valid price. The
+    running maximum skips NaN prices (it works on price levels, like ``max_drawdown``).
+
+    Needs at least 2 valid prices per column, otherwise ValueError. No sample-size warning
+    (it is a path, not an estimate).
+    """
+    frame, is_series = _prepare(prices, "prices", ordered=True, positive=True)
+    _require_obs(frame, "drawdown_series", "prices")
+    # cummax skips NaN: a NaN row stays NaN, and the maximum carries on from before it.
+    return _finish_series(1.0 - frame / frame.cummax(), prices, is_series)
+
+
+def rolling_volatility(prices, window):
+    """Trailing annualized volatility of PRICES, for charts: ``daily_returns`` then the rolling std.
+
+    Formula: ``std(last `window` daily returns, ddof=1) * sqrt(252)`` at each date, where the
+    returns are ``r_t = P_t / P_prev - 1``. It is exactly
+    ``annualized_volatility(daily_returns(prices), window=window)``: the same numbers, the
+    same warnings (GapWarning from ``daily_returns``, ShortSampleWarning for a window below
+    ``MIN_RELIABLE_WINDOW``), the same errors. Units: a fraction per year (0.28 = 28% a year).
+
+    Past data only: the value at date t uses the returns up to and including t, never later
+    ones (see ``annualized_volatility`` for how gaps and the first ``window - 1`` dates work).
+
+    Why it exists: ``annualized_volatility(returns, window=...)`` refuses a ticker whose
+    returns "look like prices" (median absolute return above 0.5, such as GME in January 2021),
+    which made the rolling-volatility chart vanish for every ticker. Here the returns are
+    computed inside, so they are known to be returns and that heuristic is skipped (the same
+    reasoning as in ``risk_summary``). ``window`` is required: a whole number of at least 2.
+    """
+    if window is None:
+        raise ValueError(f"window must be a whole number of at least 2, got {window!r}.")
+    returns = daily_returns(prices)
+    return annualized_volatility(returns, window=window, _skip_prices_check=True)
+
+
+def return_correlation(prices):
+    """Correlation of the tickers' daily returns, from PRICES, for charts.
+
+    Formula: ``corr(a, b) = cov(a, b) / (std(a) * std(b))`` of the daily returns
+    ``r_t = P_t / P_prev - 1``, for every pair of columns. It is exactly
+    ``correlation_matrix(daily_returns(prices))``: the same numbers, warnings and errors.
+    Units: from -1 through 0 to +1, as a square DataFrame (tickers x tickers).
+
+    Why it exists: ``correlation_matrix`` refuses a ticker whose returns "look like prices"
+    (median absolute return above 0.5, such as GME in January 2021), which made the
+    correlation chart vanish for every ticker. Here the returns are computed inside, so they
+    are known to be returns and that heuristic is skipped (the same reasoning as in
+    ``risk_summary``). Needs at least 2 columns, like ``correlation_matrix``.
+    """
+    returns = daily_returns(prices)
+    return correlation_matrix(returns, _skip_prices_check=True)

@@ -1555,3 +1555,702 @@ def test_the_252_day_limit_is_documented():
 
 def test_the_prices_guard_limit_is_documented():
     assert "HEURISTIC" in risk.__doc__ and "below about 0.5" in risk.__doc__
+
+
+# =========================================================================== #
+# Phase 1.5 (WP2): portfolio_value, drawdown_series, rolling_volatility, return_correlation
+#
+# Everything above is untouched. These tests are appended. The ones marked "demo snapshot"
+# read the committed files in data/demo/ through data.load_demo(): still fully offline.
+# =========================================================================== #
+
+import inspect  # noqa: E402  (appended section: the imports sit next to the tests that use them)
+
+from signaldesk import data  # noqa: E402
+from signaldesk.risk import (  # noqa: E402
+    drawdown_series,
+    portfolio_value,
+    return_correlation,
+    rolling_volatility,
+)
+
+# --- helpers ---------------------------------------------------------------------------
+
+def half_half(first="A", second="B") -> dict:
+    return {first: 0.5, second: 0.5}
+
+
+def error_on_every_risk_warning():
+    """A context manager that turns all three risk warnings into errors."""
+    context = warnings.catch_warnings()
+    context.__enter__()
+    for category in (ShortSampleWarning, GapWarning, SkippedTickerWarning):
+        warnings.simplefilter("error", category)
+    return context
+
+
+def clean_random_prices(n=250, tickers=("A", "B", "C")) -> pd.DataFrame:
+    """Gap-free, seeded random-walk prices: one row per day, no NaN."""
+    rng = np.random.default_rng(7)
+    columns = [
+        prices_from_returns(rng.normal(0.0005, 0.012, n - 1), name=t, start=50.0 + 25.0 * i)
+        for i, t in enumerate(tickers)
+    ]
+    return pd.concat(columns, axis=1)
+
+
+# --------------------------------------------------------------------------- #
+# portfolio_value: hand-checkable values
+# --------------------------------------------------------------------------- #
+
+def test_portfolio_value_fifty_fifty_opposite_moves_is_flat():
+    # A: 100 -> 110 (x1.10), B: 100 -> 90 (x0.90). Day 1: 0.5 * 1.10 + 0.5 * 0.90 = 0.55 + 0.45 = 1.0
+    prices = make_frame({"A": [100, 110], "B": [100, 90]})
+    value = portfolio_value(prices, half_half())
+    assert value.tolist() == pytest.approx([1.0, 1.0], abs=1e-12)
+
+
+def test_portfolio_value_sixty_forty_with_a_flat_holding():
+    # A: 100 -> 120 (x1.20), B: 50 -> 50 (x1.00). Day 1: 0.6 * 1.20 + 0.4 * 1.00 = 0.72 + 0.40 = 1.12
+    prices = make_frame({"A": [100, 120], "B": [50, 50]})
+    value = portfolio_value(prices, {"A": 0.6, "B": 0.4})
+    assert value.tolist() == pytest.approx([1.0, 1.12], abs=1e-12)
+
+
+def test_portfolio_value_is_buy_and_hold_not_rebalanced():
+    # A: 100, 200, 200 (x2, x2)   B: 100, 100, 200 (x1, x2).   50/50.
+    # Buy and hold:  day 1: 0.5 * 2 + 0.5 * 1 = 1.5     day 2: 0.5 * 2 + 0.5 * 2 = 2.0
+    # Daily rebalancing would give 1.5 * (1 + 0.5 * 0 + 0.5 * 1.0) = 2.25 on day 2, which is wrong here.
+    prices = make_frame({"A": [100, 200, 200], "B": [100, 100, 200]})
+    value = portfolio_value(prices, half_half())
+    assert value.tolist() == pytest.approx([1.0, 1.5, 2.0], abs=1e-12)
+    rebalanced = (1.0 + (daily_returns(prices) * 0.5).sum(axis=1)).cumprod()
+    assert rebalanced.iloc[-1] == pytest.approx(1.5 * 1.5, abs=1e-12)  # 2.25
+    assert abs(value.iloc[-1] - rebalanced.iloc[-1]) > 0.2
+
+
+def test_portfolio_value_missing_middle_price_is_valued_at_the_last_price():
+    # A: 100, 110, 121.  B: 50, NaN, 60.   50/50.
+    # day 0: 1.0
+    # day 1: A x1.10, B has no price -> last price 50 -> x1.00:  0.5 * 1.10 + 0.5 * 1.00 = 1.05
+    # day 2: A x1.21, B 60 / 50 = x1.20:                          0.5 * 1.21 + 0.5 * 1.20 = 0.605 + 0.60 = 1.205
+    prices = make_frame({"A": [100, 110, 121], "B": [50, NAN, 60]})
+    before = prices.copy()
+    value = portfolio_value(prices, half_half())
+    assert value.tolist() == pytest.approx([1.0, 1.05, 1.205], abs=1e-12)
+    assert not value.isna().any()
+    pd.testing.assert_frame_equal(prices, before)  # the gap is NOT filled in the caller's table
+
+
+def test_portfolio_value_late_starter_moves_the_start_to_the_first_common_date():
+    # A: 100, 110, 121, 133.1   B: NaN, NaN, 20, 22.   50/50.
+    # The first date with BOTH prices is row 2, so rows 0 and 1 are dropped.
+    # Row 2: 1.0.  Row 3: A 133.1 / 121 = 1.10 (measured from the START date, not from A's 100),
+    #                     B 22 / 20 = 1.10:  0.5 * 1.10 + 0.5 * 1.10 = 1.10
+    prices = make_frame({"A": [100, 110, 121, 133.1], "B": [NAN, NAN, 20, 22]})
+    value = portfolio_value(prices, half_half())
+    assert len(value) == 2
+    assert value.index.equals(prices.index[2:])
+    assert value.tolist() == pytest.approx([1.0, 1.10], abs=1e-12)
+
+
+def test_portfolio_value_start_is_the_first_date_with_every_price_not_just_the_latest_first_price():
+    # A: NaN, 100, 100, 110   B: 50, NaN, 40, 44.   50/50.
+    # Row 0: A missing.  Row 1: B missing.  Row 2: both present -> that is the start.
+    # Row 2: 1.0.  Row 3: A 110 / 100 = 1.10, B 44 / 40 = 1.10 -> 1.10.
+    # (Filling B forward from row 0 and starting on row 1 would use B = 50 as the base and
+    # give 3 rows [1.0, 0.9, 0.99]. B's price BEFORE the start date must never be used.)
+    prices = make_frame({"A": [NAN, 100, 100, 110], "B": [50, NAN, 40, 44]})
+    value = portfolio_value(prices, half_half())
+    assert value.index.equals(prices.index[2:])
+    assert value.tolist() == pytest.approx([1.0, 1.10], abs=1e-12)
+
+
+def test_portfolio_value_zero_weight_is_ignored_even_if_its_prices_are_bad():
+    # C has weight 0: it must not move the start date (it starts late), cause a warning
+    # (it has gaps), or raise (it has a zero price).
+    base = make_frame({"A": [100, 110, 121], "B": [50, 55, 44]})
+    with_c = base.assign(C=[NAN, 0.0, 7.0])
+    expected = portfolio_value(base, half_half())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", GapWarning)
+        value = portfolio_value(with_c, {"A": 0.5, "B": 0.5, "C": 0.0})
+    pd.testing.assert_series_equal(value, expected, check_exact=True)
+    # A: x1.10, x1.21.  B: x1.10, x0.88.  Row 1: 0.55 + 0.55 = 1.10.  Row 2: 0.605 + 0.44 = 1.045
+    assert value.tolist() == pytest.approx([1.0, 1.10, 1.045], abs=1e-12)
+
+
+def test_portfolio_value_extra_columns_such_as_the_benchmark_are_ignored():
+    prices = make_frame({"A": [100, 110, 121], "B": [50, 55, 44], "SPY": [400, 390, 410]})
+    only_held = portfolio_value(prices[["A", "B"]], half_half())
+    pd.testing.assert_series_equal(portfolio_value(prices, half_half()), only_held, check_exact=True)
+
+
+def test_portfolio_value_accepts_a_series_of_weights_and_ignores_their_order():
+    prices = clean_random_prices(60, ("A", "B"))
+    from_dict = portfolio_value(prices, {"A": 0.3, "B": 0.7})
+    pd.testing.assert_series_equal(portfolio_value(prices, pd.Series({"A": 0.3, "B": 0.7})), from_dict, check_exact=True)
+    pd.testing.assert_series_equal(portfolio_value(prices, {"B": 0.7, "A": 0.3}), from_dict, check_exact=True)
+
+
+# --------------------------------------------------------------------------- #
+# portfolio_value: the output
+# --------------------------------------------------------------------------- #
+
+def test_portfolio_value_output_name_type_index_and_exact_start():
+    prices = clean_random_prices(80)
+    value = portfolio_value(prices, {"A": 0.2, "B": 0.5, "C": 0.3})
+    assert isinstance(value, pd.Series)
+    assert value.name == "Portfolio"
+    assert value.dtype == "float64"
+    assert value.index.equals(prices.index)
+    assert value.index.name == "Date"
+    assert value.iloc[0] == 1.0  # exactly, not approximately
+
+
+@pytest.mark.parametrize("weights", [
+    {"A": 0.2, "B": 0.2, "C": 0.15, "D": 0.15, "E": 0.15, "F": 0.15},  # the demo weights: their float sum is not exactly 1
+    {"A": 0.1, "B": 0.2, "C": 0.3, "D": 0.1, "E": 0.1, "F": 0.2},
+    {"A": 0.5, "B": 0.5, "C": 0.0, "D": 0.0, "E": 0.0, "F": 0.0},
+    {"A": 0.5, "B": 0.5 + 5e-10, "C": 0.0, "D": 0.0, "E": 0.0, "F": 0.0},  # inside the 1e-9 tolerance
+])
+def test_portfolio_value_starts_at_exactly_one_whatever_the_float_noise_in_the_weights(weights):
+    prices = clean_random_prices(30, tuple("ABCDEF"))
+    assert portfolio_value(prices, weights).iloc[0] == 1.0
+
+
+def test_portfolio_value_does_not_modify_its_inputs_and_is_deterministic():
+    prices = make_frame({"A": [100, 110, 121, 130], "B": [50, NAN, 60, 61], "SPY": [1, 2, 3, 4]})
+    weights = {"A": 0.5, "B": 0.5}
+    weights_series = pd.Series(weights)
+    prices_before, weights_before, series_before = prices.copy(), dict(weights), weights_series.copy()
+    first = portfolio_value(prices, weights)
+    second = portfolio_value(prices, weights_series)
+    pd.testing.assert_series_equal(first, second, check_exact=True)
+    pd.testing.assert_frame_equal(prices, prices_before)
+    assert weights == weights_before
+    pd.testing.assert_series_equal(weights_series, series_before)
+
+
+def test_portfolio_value_accepts_integer_prices():
+    prices = pd.DataFrame({"A": [100, 110], "B": [100, 90]}, index=dates(2))
+    assert portfolio_value(prices, half_half()).tolist() == pytest.approx([1.0, 1.0], abs=1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# portfolio_value: validation (each one a clear ValueError)
+# --------------------------------------------------------------------------- #
+
+GOOD_PRICES = make_frame({"A": [100, 110, 121], "B": [100, 90, 95]})
+
+
+def test_portfolio_value_rejects_empty_weights():
+    for empty in ({}, pd.Series(dtype="float64")):
+        with pytest.raises(ValueError, match="weights is empty"):
+            portfolio_value(GOOD_PRICES, empty)
+
+
+def test_portfolio_value_rejects_a_ticker_that_is_not_in_prices():
+    with pytest.raises(ValueError, match=r"not in prices: 'ZZZ'"):
+        portfolio_value(GOOD_PRICES, {"A": 0.5, "ZZZ": 0.5})
+    # even with weight 0: that is almost certainly a typo
+    with pytest.raises(ValueError, match=r"not in prices: 'ZZZ'"):
+        portfolio_value(GOOD_PRICES, {"A": 0.5, "B": 0.5, "ZZZ": 0.0})
+
+
+@pytest.mark.parametrize("bad", ["0.5", None, True, [0.5], float("nan"), float("inf"), float("-inf"), pd.NA])
+def test_portfolio_value_rejects_non_numeric_nan_and_infinite_weights(bad):
+    with pytest.raises(ValueError, match=r"the weight of 'A' must be a finite number"):
+        portfolio_value(GOOD_PRICES, {"A": bad, "B": 0.5})
+
+
+def test_portfolio_value_rejects_a_nan_weight_in_a_series():
+    with pytest.raises(ValueError, match=r"the weight of 'B' must be a finite number"):
+        portfolio_value(GOOD_PRICES, pd.Series({"A": 0.5, "B": np.nan}))
+
+
+def test_portfolio_value_rejects_negative_weights_even_when_the_sum_is_one():
+    with pytest.raises(ValueError, match=r"negative weights are not supported \('B': -0\.2\)"):
+        portfolio_value(GOOD_PRICES, {"A": 1.2, "B": -0.2})
+
+
+@pytest.mark.parametrize("weights", [{"A": 0.5, "B": 0.4}, {"A": 0.6, "B": 0.5}, {"A": 0.0, "B": 0.0}, {"A": 0.5, "B": 0.5 + 2e-9}])
+def test_portfolio_value_rejects_weights_that_do_not_add_up_to_one(weights):
+    with pytest.raises(ValueError, match="add up to 1"):
+        portfolio_value(GOOD_PRICES, weights)
+
+
+def test_portfolio_value_rejects_weights_that_are_not_a_mapping():
+    for bad in ([0.5, 0.5], (0.5, 0.5), np.array([0.5, 0.5]), None, 1.0, "A"):
+        with pytest.raises(ValueError, match="dict or a pandas Series"):
+            portfolio_value(GOOD_PRICES, bad)
+    with pytest.raises(ValueError, match="more than once"):
+        portfolio_value(GOOD_PRICES, pd.Series([0.5, 0.5], index=["A", "A"]))
+
+
+@pytest.mark.parametrize("bad_price", [0.0, -5.0])
+def test_portfolio_value_rejects_a_held_price_of_zero_or_less(bad_price):
+    prices = make_frame({"A": [100, bad_price, 121], "B": [100, 90, 95]})
+    with pytest.raises(ValueError, match=r"prices must be greater than 0, but 'A'"):
+        portfolio_value(prices, half_half())
+
+
+def test_portfolio_value_rejects_prices_that_are_not_a_dataframe():
+    for bad in (GOOD_PRICES["A"], [100.0, 110.0], np.array([[100.0, 90.0], [110.0, 95.0]]), None):
+        with pytest.raises(ValueError, match="pandas DataFrame"):
+            portfolio_value(bad, {"A": 1.0})
+
+
+def test_portfolio_value_rejects_empty_unordered_and_duplicated_prices():
+    with pytest.raises(ValueError, match="empty"):
+        portfolio_value(pd.DataFrame({"A": [], "B": []}, dtype="float64"), half_half())
+    unordered = GOOD_PRICES.iloc[::-1]
+    with pytest.raises(ValueError, match="increasing order"):
+        portfolio_value(unordered, half_half())
+    repeated_dates = GOOD_PRICES.copy()
+    repeated_dates.index = [GOOD_PRICES.index[0]] * 3
+    with pytest.raises(ValueError, match="increasing order"):
+        portfolio_value(repeated_dates, half_half())
+    twice = pd.concat([GOOD_PRICES["A"], GOOD_PRICES["A"]], axis=1)
+    with pytest.raises(ValueError, match="duplicate column names"):
+        portfolio_value(twice, {"A": 1.0})
+
+
+def test_portfolio_value_raises_when_no_date_has_every_price():
+    # A is priced on rows 0-1 only, B on rows 2-3 only: they never overlap.
+    prices = make_frame({"A": [100, 101, NAN, NAN], "B": [NAN, NAN, 50, 51]})
+    with pytest.raises(ValueError, match=r"no date on which every holding has a price.*'A'.*'B'") as caught:
+        portfolio_value(prices, half_half())
+    assert "no valid price" not in str(caught.value)
+    # a holding with no price at all is named as such
+    with pytest.raises(ValueError, match=r"'B': no valid price"):
+        portfolio_value(make_frame({"A": [100, 101, 102], "B": [NAN, NAN, NAN]}), half_half())
+
+
+def test_portfolio_value_needs_at_least_two_dates_from_the_start():
+    # the only common date is the last row: a portfolio of one data point
+    prices = make_frame({"A": [100, 101, 102], "B": [NAN, NAN, 50]})
+    with pytest.raises(ValueError, match=r"need at least 2 dates from the start date .*but only 1 remain"):
+        portfolio_value(prices, half_half())
+    with pytest.raises(ValueError, match="at least 2"):
+        portfolio_value(make_frame({"A": [100.0]}), {"A": 1.0})
+
+
+# --------------------------------------------------------------------------- #
+# portfolio_value: GapWarning for dates valued at a last known price
+# --------------------------------------------------------------------------- #
+
+def test_portfolio_value_warns_once_with_the_count_per_ticker():
+    # A has two single-row gaps, B has one, C none. The late start (rows 0) is dropped and NOT counted.
+    prices = make_frame(
+        {
+            "A": [NAN, 100, NAN, 102, NAN, 104, 105],
+            "B": [50, 51, 52, NAN, 54, 55, 56],
+            "C": [10, 10, 11, 11, 12, 12, 13],
+        }
+    )
+    messages = messages_of(GapWarning, portfolio_value, prices, {"A": 0.4, "B": 0.4, "C": 0.2})
+    assert len(messages) == 1  # one warning per call, not per ticker
+    assert "'A': 2 valued at last price (longest 1 row)" in messages[0]
+    assert "'B': 1 valued at last price (longest 1 row)" in messages[0]
+    assert "'C'" not in messages[0]
+    assert "last known price" in messages[0] and "find_gaps" in messages[0]
+    assert "longer than a holiday" not in messages[0] and "Stale" not in messages[0]
+    with pytest.warns(GapWarning, match="valued at last price"):
+        portfolio_value(prices, {"A": 0.4, "B": 0.4, "C": 0.2})
+
+
+def test_portfolio_value_warning_points_at_the_caller():
+    prices = make_frame({"A": [100, 110, 121], "B": [50, NAN, 60]})
+    with pytest.warns(GapWarning) as record:
+        portfolio_value(prices, half_half())
+    assert record[0].filename == __file__
+
+
+def test_portfolio_value_a_stale_holding_gets_its_own_sentence_and_stays_flat():
+    # B's last price is on row 1; rows 2 and 3 are valued at 51. A keeps moving.
+    prices = make_frame({"A": [100, 110, 121, 133.1], "B": [50, 51, NAN, NAN]})
+    messages = messages_of(GapWarning, portfolio_value, prices, half_half())
+    assert len(messages) == 1
+    assert "'B': 2 valued at last price (longest 2 rows)" in messages[0]
+    assert f"Stale holding: 'B' has no price after {prices.index[1]:%Y-%m-%d} (2 rows to the end of the table)" in messages[0]
+    # B is held at 51 / 50 = 1.02 from row 1 on:  row 1: 0.5 * 1.10 + 0.5 * 1.02 = 0.55 + 0.51 = 1.06
+    #                                              row 2: 0.5 * 1.21 + 0.5 * 1.02 = 0.605 + 0.51 = 1.115
+    #                                              row 3: 0.5 * 1.331 + 0.5 * 1.02 = 0.6655 + 0.51 = 1.1755
+    value = portfolio_value(prices, half_half())
+    assert value.tolist() == pytest.approx([1.0, 1.06, 1.115, 1.1755], abs=1e-12)
+    # not stale when the table's last date has a price
+    fresh = make_frame({"A": [100, 110, 121], "B": [50, NAN, 60]})
+    assert "Stale" not in messages_of(GapWarning, portfolio_value, fresh, half_half())[0]
+
+
+def test_portfolio_value_stronger_wording_only_for_a_run_longer_than_a_holiday():
+    exactly_five = make_frame({"A": np.linspace(100, 107, 7), "B": [50, NAN, NAN, NAN, NAN, NAN, 56]})
+    longer = make_frame({"A": np.linspace(100, 107, 8), "B": [50, NAN, NAN, NAN, NAN, NAN, NAN, 56]})
+    five = messages_of(GapWarning, portfolio_value, exactly_five, half_half())[0]
+    six = messages_of(GapWarning, portfolio_value, longer, half_half())[0]
+    assert "(longest 5 rows)" in five and "longer than a holiday" not in five
+    assert "(longest 6 rows)" in six and "longer than a holiday: 'B' (6 rows)" in six
+
+
+def test_portfolio_value_clean_data_and_ignored_gaps_do_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # ANY warning fails the test
+        portfolio_value(clean_random_prices(120), {"A": 0.2, "B": 0.5, "C": 0.3})
+        # a gap in a zero-weight ticker, and a leading gap before the common start, are not valued at all
+        prices = make_frame({"A": [NAN, 100, 101, 102], "B": [50, 51, 52, 53], "C": [1, NAN, NAN, 4]})
+        portfolio_value(prices, {"A": 0.5, "B": 0.5, "C": 0.0})
+
+
+# --------------------------------------------------------------------------- #
+# portfolio_value: consistency with the other functions
+# --------------------------------------------------------------------------- #
+
+def test_portfolio_value_of_a_single_holding_equals_its_cumulative_returns():
+    prices = clean_random_prices(200)
+    for ticker in prices.columns:
+        value = portfolio_value(prices, {ticker: 1.0})
+        pd.testing.assert_series_equal(value, cumulative_returns(prices)[ticker], check_names=False, rtol=1e-12, atol=0)
+    # also when other columns are in the table with weight 0
+    pd.testing.assert_series_equal(
+        portfolio_value(prices, {"A": 1.0, "B": 0.0, "C": 0.0}), cumulative_returns(prices["A"]), check_names=False, rtol=1e-12, atol=0
+    )
+
+
+def test_portfolio_value_without_gaps_is_the_weighted_sum_of_cumulative_returns():
+    prices = clean_random_prices(250)
+    weights = {"A": 0.5, "B": 0.3, "C": 0.2}
+    expected = (cumulative_returns(prices) * pd.Series(weights)).sum(axis=1)
+    pd.testing.assert_series_equal(portfolio_value(prices, weights), expected, check_names=False, rtol=1e-12, atol=0)
+
+
+def test_portfolio_value_final_value_is_the_weighted_sum_of_price_ratios_even_with_gaps():
+    # holidays in the middle, a late starter: only the first common and the last rows matter for the END value
+    prices = long_prices()  # MSFT starts 10 rows late and misses row 100
+    weights = {"AAPL": 0.7, "MSFT": 0.3}
+    value = portfolio_value(prices, weights)
+    first, last = prices.iloc[10], prices.iloc[-1]
+    assert value.index.equals(prices.index[10:])
+    assert value.iloc[-1] == pytest.approx(0.7 * last["AAPL"] / first["AAPL"] + 0.3 * last["MSFT"] / first["MSFT"], rel=1e-12)
+    # on the gap date MSFT is valued at row 99's price
+    gap = prices.index[100]
+    expected_gap = 0.7 * prices["AAPL"][gap] / first["AAPL"] + 0.3 * prices["MSFT"].iloc[99] / first["MSFT"]
+    assert value[gap] == pytest.approx(expected_gap, rel=1e-12)
+
+
+def test_every_price_function_accepts_a_portfolio_series():
+    # 50/50 of A and B with a gap: [1.0, 1.05, 1.205] (see the missing-middle-price test above)
+    prices = make_frame({"A": [100, 110, 121], "B": [50, NAN, 60]})
+    value = portfolio_value(prices, half_half())
+    table = pd.DataFrame({"Portfolio": value})
+    summary = risk_summary(table)  # no SkippedTickerWarning (that one is not ignored in this file)
+    assert list(summary.index) == ["Portfolio"] and summary.loc["Portfolio", "n_obs"] == 2
+    # the annualized return is the growth 1.205 over 2 returns, stretched to 252 days
+    assert summary.loc["Portfolio", "annualized_return"] == pytest.approx(1.205 ** (252 / 2) - 1, rel=1e-9)
+    assert summary.loc["Portfolio", "max_drawdown"] == 0.0  # it only went up
+    assert max_drawdown(value) == 0.0
+    assert cumulative_returns(value).tolist() == pytest.approx(value.tolist(), abs=1e-15)  # it starts at 1.0 already
+    assert daily_returns(value).tolist() == pytest.approx([0.05, 1.205 / 1.05 - 1], abs=1e-12)
+    assert drawdown_series(value).tolist() == [0.0, 0.0, 0.0]
+
+
+# --------------------------------------------------------------------------- #
+# drawdown_series
+# --------------------------------------------------------------------------- #
+
+def test_drawdown_series_known_values():
+    # prices [100, 120, 90, 130]; running max [100, 120, 120, 130]
+    # 1 - P/max: [1 - 100/100, 1 - 120/120, 1 - 90/120, 1 - 130/130] = [0, 0, 0.25, 0]
+    # (against the GLOBAL max 130 it would be [0.23, 0.08, 0.31, 0]: not the answer)
+    result = drawdown_series(make_series([100, 120, 90, 130]))
+    assert result.tolist() == [0.0, 0.0, 0.25, 0.0]  # exact: 90 / 120 = 0.75 in binary floating point
+    assert result.name == "AAPL"
+    assert result.index.equals(dates(4))
+
+
+def test_drawdown_series_is_a_positive_fraction_and_zero_at_every_new_peak():
+    prices = make_series([100, 90, 95, 100, 80, 120, 119.4])
+    result = drawdown_series(prices)
+    assert (result >= 0).all() and (result <= 1).all()
+    # peak days (100 at row 0, 100 at row 3 equals the old peak, 120 at row 5): exactly 0
+    assert result.iloc[[0, 3, 5]].tolist() == [0.0, 0.0, 0.0]
+    # row 1: 1 - 90/100 = 0.10 ; row 4: 1 - 80/100 = 0.20 (the peak is still 100) ; row 6: 1 - 119.4/120 = 0.005
+    assert result.iloc[[1, 4, 6]].tolist() == pytest.approx([0.10, 0.20, 0.005], abs=1e-12)
+
+
+def test_drawdown_series_maximum_equals_max_drawdown():
+    for prices in (make_series([100, 120, 90, 130]), make_series([100, 90, 95, 100, 80, 120, 119.4]), make_series([100, 100, 100]), make_series([1, 2, 3])):
+        assert drawdown_series(prices).max() == max_drawdown(prices)  # exactly equal, not just close
+    table = long_prices()
+    assert (drawdown_series(table).max() == max_drawdown(table)).all()
+    pd.testing.assert_series_equal(drawdown_series(table).max(), max_drawdown(table), check_names=False, check_exact=True)
+
+
+def test_drawdown_series_skips_nan_and_keeps_it_as_nan():
+    # prices [NaN, 100, NaN, 80, 120, 60]: NaN rows give NaN; the running max skips them
+    # row 1: 0 ; row 3: 1 - 80/100 = 0.20 ; row 4: 0 (new peak) ; row 5: 1 - 60/120 = 0.50
+    prices = make_series([NAN, 100, NAN, 80, 120, 60])
+    result = drawdown_series(prices)
+    assert result.isna().tolist() == [True, False, True, False, False, False]
+    assert result.dropna().tolist() == pytest.approx([0.0, 0.20, 0.0, 0.50], abs=1e-12)
+    assert result.max() == max_drawdown(prices) == 0.5
+
+
+def test_drawdown_series_dataframe_is_a_dataframe_with_independent_columns():
+    prices = make_frame({"UP": [100, 110, 120, 130], "DIP": [100, 120, 90, 130]})
+    result = drawdown_series(prices)
+    assert isinstance(result, pd.DataFrame)
+    assert list(result.columns) == ["UP", "DIP"] and result.index.equals(prices.index)
+    assert result["UP"].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert result["DIP"].tolist() == [0.0, 0.0, 0.25, 0.0]
+    pd.testing.assert_series_equal(result["DIP"], drawdown_series(prices["DIP"]), check_exact=True)
+
+
+def test_drawdown_series_does_not_modify_its_input_and_is_deterministic():
+    prices = long_prices()
+    before = prices.copy()
+    pd.testing.assert_frame_equal(drawdown_series(prices), drawdown_series(prices))
+    pd.testing.assert_frame_equal(prices, before)
+
+
+@pytest.mark.parametrize("bad", [[100.0, 110.0], None, "AAPL"])
+def test_drawdown_series_rejects_non_pandas_input(bad):
+    with pytest.raises(ValueError, match="pandas"):
+        drawdown_series(bad)
+
+
+def test_drawdown_series_input_checks():
+    with pytest.raises(ValueError, match=r"at least 2 valid prices per column, but 'AAPL' has 1"):
+        drawdown_series(make_series([100.0]))
+    with pytest.raises(ValueError, match=r"'LATE' has 1"):
+        drawdown_series(make_frame({"AAPL": [100, 101, 102], "LATE": [NAN, NAN, 5]}))
+    with pytest.raises(ValueError, match="greater than 0"):
+        drawdown_series(make_series([100, 0.0, 110]))
+    with pytest.raises(ValueError, match="increasing order"):
+        drawdown_series(make_series([100, 101, 102]).iloc[::-1])
+    with pytest.raises(ValueError, match="empty"):
+        drawdown_series(pd.DataFrame())
+
+
+# --------------------------------------------------------------------------- #
+# rolling_volatility and return_correlation (A4: charts from prices)
+# --------------------------------------------------------------------------- #
+
+def test_rolling_volatility_equals_the_two_step_call_exactly():
+    prices = long_prices()  # late starter and a holiday: the awkward case
+    two_step = annualized_volatility(daily_returns(prices), window=30)
+    pd.testing.assert_frame_equal(rolling_volatility(prices, 30), two_step, check_exact=True)
+    pd.testing.assert_series_equal(
+        rolling_volatility(prices["MSFT"], 30), annualized_volatility(daily_returns(prices["MSFT"]), window=30), check_exact=True
+    )
+    assert rolling_volatility(prices, 30).shape == (250, 2)  # one row per return, like daily_returns
+
+
+def test_rolling_volatility_known_value():
+    # returns [+0.01, -0.01, +0.01]; window 3: mean 0.01/3, deviations 2a/3, -4a/3, 2a/3 (a = 0.01)
+    # sum of squares 24a^2/9, / (3 - 1) -> variance 4a^2/3 -> std = 2a/sqrt(3) = 0.0115470
+    # annualized: 0.01 * 2 / sqrt(3) * sqrt(252) = 0.02 * sqrt(84) = 0.183303
+    prices = prices_from_returns([0.01, -0.01, 0.01])
+    result = rolling_volatility(prices, 3)
+    assert result.isna().tolist() == [True, True, False]  # only a FULL window of returns gives a value
+    assert result.iloc[-1] == pytest.approx(0.02 * math.sqrt(84), rel=1e-9)
+
+
+def test_rolling_volatility_uses_only_the_past():
+    prices = long_prices()
+    cut = 150
+    changed = prices.copy()
+    changed.iloc[cut:, :] = changed.iloc[cut:, :] * 3.0  # a crash-sized change from row 150 on
+    before = rolling_volatility(prices, 30)
+    after = rolling_volatility(changed, 30)
+    # the return of row 150 already changed (it is measured against row 149), so rows < 150 cannot differ
+    pd.testing.assert_frame_equal(before.iloc[: cut - 1], after.iloc[: cut - 1], check_exact=True)
+    assert not before.iloc[cut + 5 :].equals(after.iloc[cut + 5 :])  # ... and later rows do react
+
+
+def test_rolling_volatility_computes_a_squeeze_that_the_public_two_step_refuses():
+    prices = gme_like_prices()  # GME returns +18%, +93%, +135%: median 0.93 "looks like prices"
+    returns = daily_returns(prices)
+    with pytest.raises(ValueError, match="'GME' looks like prices, not returns"):
+        annualized_volatility(returns, window=3)
+    result = rolling_volatility(prices, 3)
+    assert list(result.columns) == ["GME", "AAPL"] and result.index.equals(returns.index)
+    # GME, full window: std of (0.18, 0.93, 1.35) = sqrt(0.3513), by hand in the earlier GME test
+    assert result["GME"].iloc[-1] == pytest.approx(math.sqrt(0.3513) * math.sqrt(252), rel=1e-9)
+    assert result["AAPL"].notna().iloc[-1]  # the calm ticker is not lost
+    assert result["GME"].iloc[:2].isna().all()
+    assert rolling_volatility(prices["GME"], 3).iloc[-1] == pytest.approx(result["GME"].iloc[-1], rel=1e-12)
+
+
+def test_rolling_volatility_gives_the_same_warnings_as_the_two_step_call():
+    prices = long_prices()
+    returns = daily_returns(prices)
+    assert messages_of(GapWarning, rolling_volatility, prices, 30) == messages_of(GapWarning, daily_returns, prices)
+    assert len(messages_of(GapWarning, rolling_volatility, prices, 30)) == 1
+    assert short_sample_messages(rolling_volatility, prices, 5) == short_sample_messages(annualized_volatility, returns, window=5)
+    assert len(short_sample_messages(rolling_volatility, prices, 5)) == 1  # a window of 5 is below MIN_RELIABLE_WINDOW
+    assert not short_sample_messages(rolling_volatility, prices, 30)
+
+
+@pytest.mark.parametrize("window", [None, 0, 1, -3, 2.5, 3.0, "5", True, [3]])
+def test_rolling_volatility_needs_a_window_of_at_least_two(window):
+    with pytest.raises(ValueError, match="window must be a whole number of at least 2"):
+        rolling_volatility(long_prices(), window)
+
+
+def test_rolling_volatility_errors_match_the_two_step_call():
+    with pytest.raises(ValueError, match="longer than the 250 rows"):
+        rolling_volatility(long_prices(), 300)
+    with pytest.raises(ValueError, match="at least 2 valid prices"):
+        rolling_volatility(make_series([100.0]), 3)
+    with pytest.raises(ValueError, match="greater than 0"):
+        rolling_volatility(make_series([100, 0.0, 110, 111]), 2)
+    with pytest.raises(ValueError, match="pandas"):
+        rolling_volatility([100.0, 101.0, 102.0], 2)
+    prices = long_prices()
+    before = prices.copy()
+    rolling_volatility(prices, 30)
+    pd.testing.assert_frame_equal(prices, before)
+
+
+def test_return_correlation_equals_the_two_step_call_exactly():
+    prices = long_prices()
+    pd.testing.assert_frame_equal(return_correlation(prices), correlation_matrix(daily_returns(prices)), check_exact=True)
+    assert messages_of(GapWarning, return_correlation, prices) == messages_of(GapWarning, daily_returns, prices)
+    short = prices.iloc[:30]  # fewer than 60 shared returns: the ShortSampleWarning comes through unchanged
+    assert short_sample_messages(return_correlation, short) == short_sample_messages(correlation_matrix, daily_returns(short))
+    assert len(short_sample_messages(return_correlation, short)) == 1
+
+
+def test_return_correlation_known_value_from_prices():
+    # B moves exactly twice as much as A each day, so the correlation is +1, and the opposite for C
+    a = prices_from_returns([0.01, -0.02, 0.015, 0.03], "A")
+    b = prices_from_returns([0.02, -0.04, 0.03, 0.06], "B")
+    c = prices_from_returns([-0.01, 0.02, -0.015, -0.03], "C")
+    result = return_correlation(pd.concat([a, b, c], axis=1))
+    assert list(result.index) == list(result.columns) == ["A", "B", "C"]
+    assert result.loc["A", "B"] == pytest.approx(1.0, abs=1e-9)
+    assert result.loc["A", "C"] == pytest.approx(-1.0, abs=1e-9)
+    assert np.diag(result.to_numpy()).tolist() == pytest.approx([1.0, 1.0, 1.0])
+
+
+def test_return_correlation_computes_a_squeeze_that_the_public_two_step_refuses():
+    prices = gme_like_prices()
+    returns = daily_returns(prices)
+    with pytest.raises(ValueError, match="looks like prices, not returns"):
+        correlation_matrix(returns)
+    result = return_correlation(prices)
+    assert list(result.index) == list(result.columns) == ["GME", "AAPL"]
+    # an independent check with numpy on the same three returns each
+    assert result.loc["GME", "AAPL"] == pytest.approx(np.corrcoef(returns["GME"], returns["AAPL"])[0, 1], abs=1e-12)
+    assert result.loc["GME", "GME"] == 1.0
+
+
+def test_return_correlation_needs_two_columns_and_valid_prices():
+    with pytest.raises(ValueError, match="at least 2 columns"):
+        return_correlation(long_prices()["AAPL"])
+    with pytest.raises(ValueError, match="at least 2 columns"):
+        return_correlation(long_prices()[["AAPL"]])
+    with pytest.raises(ValueError, match="greater than 0"):
+        return_correlation(make_frame({"A": [100, 0.0, 110], "B": [50, 51, 52]}))
+    prices = long_prices()
+    before = prices.copy()
+    return_correlation(prices)
+    pd.testing.assert_frame_equal(prices, before)
+
+
+def test_correlation_matrix_private_flag_is_keyword_only_and_off_by_default():
+    parameter = inspect.signature(correlation_matrix).parameters["_skip_prices_check"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is False
+    returns = daily_returns(gme_like_prices())
+    with pytest.raises(ValueError, match="looks like prices"):
+        correlation_matrix(returns)
+    assert correlation_matrix(returns, _skip_prices_check=True).shape == (2, 2)
+
+
+def test_the_original_public_signatures_did_not_change():
+    expected = {
+        "daily_returns": "(prices)",
+        "cumulative_returns": "(prices)",
+        "annualized_return": "(returns, *, _skip_prices_check=False)",
+        "annualized_volatility": "(returns, window=None, *, _skip_prices_check=False)",
+        "correlation_matrix": "(returns, *, _skip_prices_check=False)",
+        "max_drawdown": "(prices)",
+        "historical_var": "(returns, confidence=0.95, *, _skip_prices_check=False)",
+        "sharpe_ratio": "(returns, risk_free_rate=0.0, *, _skip_prices_check=False)",
+        "risk_summary": "(prices, confidence=0.95, risk_free_rate=0.0)",
+    }
+    for name, signature in expected.items():
+        assert str(inspect.signature(getattr(risk, name))) == signature
+        assert name in risk.__all__
+    for name in ("portfolio_value", "drawdown_series", "rolling_volatility", "return_correlation"):
+        assert name in risk.__all__
+
+
+# --------------------------------------------------------------------------- #
+# The committed demo snapshot (data.load_demo, offline): the real numbers the site will show
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(scope="module")
+def demo():
+    return data.load_demo()
+
+
+def test_demo_portfolio_value_starts_at_one_and_covers_the_whole_snapshot(demo):
+    value = portfolio_value(demo.prices, demo.holdings)
+    assert value.name == "Portfolio" and value.dtype == "float64"
+    assert value.iloc[0] == 1.0
+    assert len(value) == len(demo.prices) == 1254
+    assert value.index.equals(demo.prices.index)  # no NaN in the snapshot, so the start is the first row
+    assert value.notna().all() and (value > 0).all()
+
+
+def test_demo_portfolio_final_value_matches_an_independent_numpy_calculation(demo):
+    value = portfolio_value(demo.prices, demo.holdings)
+    tickers = list(demo.holdings)
+    weights = np.array([demo.holdings[t] for t in tickers])
+    p = demo.prices[tickers].to_numpy()
+    assert abs(value.iloc[-1] - float(np.sum(weights * p[-1] / p[0]))) < 1e-12
+    middle = 600
+    assert abs(value.iloc[middle] - float(np.sum(weights * p[middle] / p[0]))) < 1e-12
+    # buy and hold, not daily rebalancing: the two differ by a lot over five years
+    rebalanced = float((1.0 + (daily_returns(demo.prices[tickers]) * weights).sum(axis=1)).cumprod().iloc[-1])
+    assert abs(value.iloc[-1] - rebalanced) > 0.01
+
+
+def test_demo_risk_summary_runs_on_portfolio_and_benchmark_without_skipping_anything(demo):
+    value = portfolio_value(demo.prices, demo.holdings)
+    table = pd.DataFrame({"Portfolio": value, demo.benchmark: demo.prices[demo.benchmark]})
+    context = error_on_every_risk_warning()  # any SkippedTickerWarning, GapWarning or ShortSampleWarning fails
+    try:
+        summary = risk_summary(table)
+    finally:
+        context.__exit__(None, None, None)
+    assert list(summary.index) == ["Portfolio", "SPY"]
+    assert summary.notna().all().all()
+    assert (summary["n_obs"] == len(demo.prices) - 1).all()
+    # a row does not depend on the other ticker in the table
+    pd.testing.assert_series_equal(summary.loc["SPY"], risk_summary(demo.prices[["SPY"]]).loc["SPY"], check_exact=True)
+
+
+def test_demo_drawdown_series_maximum_equals_max_drawdown(demo):
+    value = portfolio_value(demo.prices, demo.holdings)
+    table = demo.prices.assign(Portfolio=value)
+    curves = drawdown_series(table)
+    assert curves.shape == table.shape and curves.notna().all().all()
+    assert (curves.max() == max_drawdown(table)).all()  # exactly equal, for every ticker and the portfolio
+    assert (curves.min() == 0.0).all()
+
+
+def test_demo_chart_functions_equal_the_two_step_calls_and_do_not_warn(demo):
+    returns = daily_returns(demo.prices)
+    context = error_on_every_risk_warning()
+    try:
+        rolling = rolling_volatility(demo.prices, 60)
+        corr = return_correlation(demo.prices)
+    finally:
+        context.__exit__(None, None, None)
+    pd.testing.assert_frame_equal(rolling, annualized_volatility(returns, window=60), check_exact=True)
+    pd.testing.assert_frame_equal(corr, correlation_matrix(returns), check_exact=True)
+    assert rolling.shape == returns.shape and rolling.iloc[58].isna().all() and rolling.iloc[59].notna().all()
+    assert list(corr.columns) == list(demo.prices.columns)
