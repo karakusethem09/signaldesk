@@ -1,0 +1,21 @@
+# Streamlit settings for SignalDesk. Streamlit reads this file when it is started from the project folder
+# (and Streamlit Community Cloud reads it from the repository).
+
+[client]
+# A visitor never sees a Python traceback in the browser (it stays in the server log).
+showErrorDetails = "none"
+# Hide the developer menu (deploy, rerun, clear cache) from visitors.
+toolbarMode = "viewer"
+
+[browser]
+# No usage statistics are sent to Streamlit.
+gatherUsageStats = false
+
+[theme]
+# A calm, professional light theme with a deep blue accent.
+base = "light"
+primaryColor = "#1F4E8C"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F4F9"
+textColor = "#1B2733"
+font = "sans serif"
