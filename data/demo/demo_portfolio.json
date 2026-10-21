@@ -1,0 +1,13 @@
+{
+  "name": "Demo: diversified US large caps",
+  "holdings": {
+    "AAPL": 0.20,
+    "MSFT": 0.20,
+    "NVDA": 0.15,
+    "JPM": 0.15,
+    "XOM": 0.15,
+    "JNJ": 0.15
+  },
+  "benchmark": "SPY",
+  "years": 5
+}

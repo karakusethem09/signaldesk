@@ -1,0 +1,16 @@
+{
+  "as_of": "2026-10-19",
+  "start": "2021-10-20",
+  "rows": 1254,
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "JPM",
+    "XOM",
+    "JNJ",
+    "SPY"
+  ],
+  "source": "Yahoo Finance via yfinance 1.7.0, adjusted close",
+  "created_at": "2026-10-20T18:32:44Z"
+}

@@ -6,6 +6,16 @@ How we avoid the network: ``load_prices`` calls ``download_prices``, and
 tables (and count how often they were called).
 """
 
+import datetime
+import os
+import socket
+import sqlite3
+import threading
+import time
+import uuid
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -1091,3 +1101,943 @@ def test_cache_path_is_filename_safe_and_short_for_long_ticker_lists(tmp_path):
     assert len(long_path.name) < 100
     assert long_path == data._cache_path(tmp_path, list(reversed(many)), "2026-01-01", "2026-03-01")
     assert long_path != data._cache_path(tmp_path, many[:-1], "2026-01-01", "2026-03-01")
+
+
+# =========================================================================== #
+# Phase 1.5 additions: provider errors, safe cache writes, pruning, market_today
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# ProviderUnavailableError: "nothing came back at all"
+# --------------------------------------------------------------------------- #
+
+def patch_yf_raising(monkeypatch, error):
+    """Replace yf.download with a fake that raises ``error``."""
+
+    def fake_download(tickers, **kwargs):
+        raise error
+
+    monkeypatch.setattr(data.yf, "download", fake_download)
+
+
+def test_provider_unavailable_error_is_a_price_data_error_and_a_value_error():
+    assert issubclass(data.ProviderUnavailableError, PriceDataError)
+    assert issubclass(data.ProviderUnavailableError, ValueError)
+    assert "ProviderUnavailableError" in data.__all__
+
+
+@pytest.mark.parametrize("empty_result", [pd.DataFrame(), None])
+def test_download_with_no_data_for_any_ticker_raises_provider_unavailable(monkeypatch, empty_result):
+    patch_yf(monkeypatch, empty_result)
+
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+    message = str(caught.value)
+    assert "(AAPL, MSFT)" in message  # names every ticker we asked for
+    assert "between 2026-01-01 and 2026-01-09" in message  # the last day ASKED for (the 10th is excluded)
+    assert "rate-limiting or unavailable" in message  # the provider may be the problem...
+    assert "symbols may not exist" in message  # ...or the symbols may be...
+    assert "no trading days" in message  # ...or the dates may contain no trading day at all
+    assert "try again later" in message
+
+
+def test_download_with_every_column_all_nan_raises_provider_unavailable(monkeypatch):
+    # Rows exist but every ticker is empty: the typical answer of a rate-limiting Yahoo.
+    raw = yfinance_style(
+        ["AAPL", "MSFT"], {"2026-01-02": [np.nan, np.nan], "2026-01-05": [np.nan, np.nan]}
+    )
+    patch_yf(monkeypatch, raw)
+
+    with pytest.raises(data.ProviderUnavailableError, match=r"\(AAPL, MSFT\)"):
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+
+def test_download_with_a_single_missing_ticker_is_provider_unavailable_too(monkeypatch):
+    # With one ticker, "every ticker is empty" is true, so the message covers both causes.
+    raw = yfinance_style(["ZZZZ"], {"2026-01-02": [np.nan]})
+    patch_yf(monkeypatch, raw)
+
+    with pytest.raises(data.ProviderUnavailableError, match="symbol may not exist"):  # singular: one symbol
+        download_prices(["ZZZZ"], "2026-01-01", "2026-01-10")
+
+
+def test_download_with_only_some_tickers_missing_is_a_plain_price_data_error(monkeypatch):
+    raw = yfinance_style(
+        ["AAPL", "ZZZZ"], {"2026-01-02": [270.0, np.nan], "2026-01-05": [266.5, np.nan]}
+    )
+    patch_yf(monkeypatch, raw)
+
+    with pytest.raises(PriceDataError, match="ZZZZ") as caught:
+        download_prices(["AAPL", "ZZZZ"], "2026-01-01", "2026-01-10")
+    assert not isinstance(caught.value, data.ProviderUnavailableError)  # the provider works
+    assert "AAPL" not in str(caught.value)  # only the missing ticker is named
+
+
+def test_download_with_a_ticker_absent_from_the_result_is_a_plain_price_data_error(monkeypatch):
+    patch_yf(monkeypatch, yfinance_style(["AAPL"], {"2026-01-02": [270.0]}))
+
+    with pytest.raises(PriceDataError, match="MSFT") as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+    assert not isinstance(caught.value, data.ProviderUnavailableError)
+
+
+def test_download_with_a_missing_close_field_is_still_a_plain_price_data_error(monkeypatch):
+    patch_yf(monkeypatch, pd.DataFrame({"Open": [1.0]}, index=pd.to_datetime(["2026-01-02"])))
+
+    with pytest.raises(PriceDataError, match="Close") as caught:
+        download_prices(["AAPL"], "2026-01-01", "2026-01-10")
+    assert not isinstance(caught.value, data.ProviderUnavailableError)
+
+
+def test_existing_except_price_data_error_code_still_catches_the_new_error(monkeypatch):
+    patch_yf(monkeypatch, pd.DataFrame())
+    try:
+        download_prices(["AAPL"], "2026-01-01", "2026-01-10")
+    except PriceDataError as error:
+        assert isinstance(error, data.ProviderUnavailableError)
+    else:
+        raise AssertionError("expected an error")
+
+
+def provider_errors():
+    from yfinance.exceptions import YFRateLimitError
+
+    return [
+        YFRateLimitError(),
+        ConnectionError("connection reset"),
+        TimeoutError("timed out"),
+        OSError("network is unreachable"),
+    ]
+
+
+@pytest.mark.parametrize("index", range(4))
+def test_rate_limit_and_network_errors_become_provider_unavailable(monkeypatch, index):
+    original = provider_errors()[index]
+    patch_yf_raising(monkeypatch, original)
+
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+    message = str(caught.value)
+    assert "AAPL, MSFT" in message
+    assert "rate-limiting or unreachable" in message
+    assert caught.value.__cause__ is original  # the real error is kept for debugging...
+    assert str(original) not in message  # ...but not shown in the visitor-facing text
+
+
+def test_curl_cffi_network_errors_are_treated_as_provider_unavailable(monkeypatch):
+    # yfinance 1.7 talks to Yahoo through curl_cffi; its errors are OSError subclasses.
+    from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
+
+    patch_yf_raising(monkeypatch, CurlConnectionError("Could not resolve host"))
+    with pytest.raises(data.ProviderUnavailableError):
+        download_prices(["AAPL"], "2026-01-01", "2026-01-10")
+
+
+@pytest.mark.parametrize(
+    "local_error",
+    [PermissionError("denied"), FileNotFoundError("no such folder"), NotADirectoryError("x")],
+)
+def test_problems_on_this_computer_are_not_blamed_on_the_provider(monkeypatch, local_error):
+    patch_yf_raising(monkeypatch, local_error)
+    with pytest.raises(type(local_error)):
+        download_prices(["AAPL"], "2026-01-01", "2026-01-10")
+
+
+@pytest.mark.parametrize("bug", [RuntimeError("a real bug"), KeyError("x"), AssertionError("oops")])
+def test_unexpected_errors_are_not_swallowed(monkeypatch, bug):
+    patch_yf_raising(monkeypatch, bug)
+    with pytest.raises(type(bug)):
+        download_prices(["AAPL"], "2026-01-01", "2026-01-10")
+
+
+def test_load_prices_passes_the_provider_error_through_and_writes_no_cache(monkeypatch, tmp_path):
+    patch_yf(monkeypatch, pd.DataFrame())
+
+    with pytest.raises(data.ProviderUnavailableError, match="rate-limiting"):
+        load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01", cache_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_load_prices_with_a_rate_limit_error_writes_no_cache(monkeypatch, tmp_path):
+    patch_yf_raising(monkeypatch, provider_errors()[0])
+
+    with pytest.raises(PriceDataError):
+        load_prices(["AAPL"], "2026-01-01", "2026-03-01", cache_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_load_prices_with_some_tickers_missing_stays_a_plain_price_data_error(monkeypatch, tmp_path):
+    raw = yfinance_style(["AAPL", "ZZZZ"], {"2026-01-02": [270.0, np.nan], "2026-01-05": [266.5, np.nan]})
+    patch_yf(monkeypatch, raw)
+
+    with pytest.raises(PriceDataError, match="ZZZZ") as caught:
+        load_prices(["AAPL", "ZZZZ"], "2026-01-01", "2026-03-01", cache_dir=tmp_path)
+    assert not isinstance(caught.value, data.ProviderUnavailableError)
+
+
+# --------------------------------------------------------------------------- #
+# W3: a date range without trading days (weekend, holiday) is not a provider problem
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "start, end, expected",
+    [
+        ("2026-10-17", "2026-10-19", " between 2026-10-17 and 2026-10-18"),  # Saturday + Sunday
+        ("2026-10-17", "2026-10-18", " on 2026-10-17"),  # a single day
+        ("2026-01-01", "2026-01-10", " between 2026-01-01 and 2026-01-09"),
+        ("2025-12-30", "2026-01-02", " between 2025-12-30 and 2026-01-01"),  # across a year end
+        ("2024-02-28", "2024-03-01", " between 2024-02-28 and 2024-02-29"),  # across a leap day
+    ],
+)
+def test_describe_window_names_the_last_day_that_was_asked_for(start, end, expected):
+    assert data._describe_window(start, end) == expected
+
+
+@pytest.mark.parametrize(
+    "start, end",
+    [
+        ("2026-10-17", "2026-10-19"),  # Saturday to Sunday
+        ("2026-09-07", "2026-09-08"),  # Labor Day, a Monday when the US market is closed
+    ],
+)
+def test_a_range_without_trading_days_names_that_cause_and_the_dates(monkeypatch, start, end):
+    patch_yf(monkeypatch, pd.DataFrame())  # what Yahoo really returns for such a range
+
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL"], start, end)
+
+    message = str(caught.value)
+    last_day = (pd.Timestamp(end) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    assert start in message and last_day in message  # the dates are named
+    assert "no trading days" in message and "weekend" in message
+    assert "rate-limiting or unavailable" in message  # the other causes are still named
+    assert "symbol may not exist" in message
+
+
+def test_the_all_nan_path_names_the_dates_too(monkeypatch):
+    # Rows exist but the only ticker is empty: this goes through _require_all_tickers.
+    raw = yfinance_style(["AAPL"], {"2026-10-16": [np.nan]})
+    patch_yf(monkeypatch, raw)
+
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL"], "2026-10-17", "2026-10-19")
+    assert "between 2026-10-17 and 2026-10-18" in str(caught.value)
+    assert "no trading days" in str(caught.value)
+
+
+def test_the_partly_missing_message_also_names_the_dates(monkeypatch):
+    raw = yfinance_style(["AAPL", "ZZZZ"], {"2026-01-02": [270.0, np.nan]})
+    patch_yf(monkeypatch, raw)
+    with pytest.raises(PriceDataError, match=r"ZZZZ between 2026-01-01 and 2026-01-09"):
+        download_prices(["AAPL", "ZZZZ"], "2026-01-01", "2026-01-10")
+
+
+def test_load_prices_for_a_weekend_gives_the_no_trading_days_message(monkeypatch, tmp_path):
+    patch_yf(monkeypatch, pd.DataFrame())
+    # (the pinned "today" is 2026-06-15; 30 and 31 May 2026 are a Saturday and a Sunday)
+    with pytest.raises(data.ProviderUnavailableError, match=r"between 2026-05-30 and 2026-05-31.*no trading days"):
+        load_prices(["AAPL"], "2026-05-30", "2026-06-01", cache_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# W2: what REAL yfinance does with errors. These tests run the real yf.download
+# (threads, per-ticker error catching, table building) and replace only
+# Ticker.history, the one method that talks to Yahoo. Every attempt to open a
+# network connection is refused and recorded, and the test fails if there was one.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def real_yf(monkeypatch):
+    attempts = []
+
+    def refuse(*args, **kwargs):
+        attempts.append(args)
+        raise AssertionError("a test tried to use the network")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "getaddrinfo", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    yield
+    assert attempts == []  # nothing even tried to reach the network
+
+
+def history_frame() -> pd.DataFrame:
+    """What Ticker.history returns: one table per ticker, timezone-aware exchange dates."""
+    index = pd.DatetimeIndex(["2026-01-02", "2026-01-05"]).tz_localize("America/New_York")
+    return pd.DataFrame(
+        {"Open": [1.0, 2.0], "High": [3.0, 4.0], "Low": [0.5, 1.5], "Close": [270.0, 266.5], "Volume": [10, 20]},
+        index=index,
+    )
+
+
+def patch_history(monkeypatch, behaviour):
+    """Replace Ticker.history by ``behaviour(ticker)``, which returns a table or raises."""
+
+    def fake_history(self, *args, **kwargs):
+        return behaviour(self.ticker)
+
+    monkeypatch.setattr(data.yf.Ticker, "history", fake_history)
+
+
+# (error class, constructor arguments): built fresh for every use, never shared between tests
+PROVIDER_FAILURES = [
+    pytest.param("yfinance.exceptions:YFRateLimitError", (), id="YFRateLimitError"),
+    pytest.param("builtins:ConnectionError", ("connection reset",), id="ConnectionError"),
+    pytest.param("builtins:TimeoutError", ("timed out",), id="TimeoutError"),
+    pytest.param("curl_cffi.requests.exceptions:ConnectionError", ("Could not resolve host",), id="curl_cffi"),
+]
+
+
+def make_failure(spec: str, args: tuple) -> Exception:
+    import importlib
+
+    module, name = spec.split(":")
+    return getattr(importlib.import_module(module), name)(*args)
+
+
+def test_real_download_works_offline_with_a_patched_history(real_yf, monkeypatch):
+    # The healthy path through the real yf.download: this proves the setup below is realistic.
+    patch_history(monkeypatch, lambda ticker: history_frame())
+
+    result = download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+    assert list(result.columns) == ["AAPL", "MSFT"]
+    assert list(result["AAPL"]) == [270.0, 266.5]
+
+
+@pytest.mark.parametrize("spec, args", PROVIDER_FAILURES)
+def test_real_download_with_every_ticker_failing_is_provider_unavailable(real_yf, monkeypatch, spec, args):
+    def fail(ticker):
+        raise make_failure(spec, args)
+
+    patch_history(monkeypatch, fail)
+
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+    message = str(caught.value)
+    assert "(AAPL, MSFT)" in message
+    assert "rate-limiting or unavailable" in message
+
+
+@pytest.mark.parametrize("spec, args", PROVIDER_FAILURES)
+def test_real_download_with_one_of_two_tickers_failing_admits_both_causes(real_yf, monkeypatch, spec, args):
+    # yfinance turns the failure into "no data for MSFT". We cannot tell a rate limit from a
+    # mistyped symbol, so the message must not blame the visitor alone.
+    def sometimes_fail(ticker):
+        if ticker == "MSFT":
+            raise make_failure(spec, args)
+        return history_frame()
+
+    patch_history(monkeypatch, sometimes_fail)
+
+    with pytest.raises(PriceDataError) as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+    message = str(caught.value)
+    assert not isinstance(caught.value, data.ProviderUnavailableError)  # the provider answered for AAPL
+    assert "MSFT" in message and "AAPL" not in message  # only the missing ticker is named
+    assert "may not exist" in message  # the symbol may be wrong...
+    assert "data provider may have failed" in message and "rate limit" in message  # ...or the provider failed
+    assert "try again in a minute" in message
+
+
+def test_real_download_with_one_failing_ticker_through_load_prices_writes_no_cache(real_yf, monkeypatch, tmp_path):
+    patch_history(monkeypatch, lambda t: (_ for _ in ()).throw(ConnectionError("x")) if t == "MSFT" else history_frame())
+    with pytest.raises(PriceDataError, match="data provider may have failed"):
+        load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01", cache_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_local_error_inside_yfinance_also_surfaces_as_missing_data(real_yf, monkeypatch):
+    # yfinance keeps its own small database on this computer. If that fails (this is a real
+    # message seen live), yfinance swallows the error like any other and reports "no data".
+    # We cannot see the cause, so for one ticker it is the same message as a rate limit.
+    def locked(ticker):
+        if ticker == "MSFT":
+            raise sqlite3.OperationalError("database is locked")
+        return history_frame()
+
+    patch_history(monkeypatch, locked)
+    with pytest.raises(PriceDataError, match="MSFT") as caught:
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+    assert not isinstance(caught.value, data.ProviderUnavailableError)
+
+    def always_locked(ticker):
+        raise sqlite3.OperationalError("database is locked")
+
+    patch_history(monkeypatch, always_locked)
+    with pytest.raises(data.ProviderUnavailableError):
+        download_prices(["AAPL", "MSFT"], "2026-01-01", "2026-01-10")
+
+
+def test_real_download_of_a_weekend_is_the_no_trading_days_message(real_yf, monkeypatch):
+    patch_history(monkeypatch, lambda ticker: pd.DataFrame())  # Yahoo: an empty table for a weekend
+
+    with pytest.raises(data.ProviderUnavailableError) as caught:
+        download_prices(["AAPL"], "2026-10-17", "2026-10-19")
+
+    message = str(caught.value)
+    assert "between 2026-10-17 and 2026-10-18" in message and "no trading days" in message
+
+
+# --------------------------------------------------------------------------- #
+# D7: every cache write uses its own temporary file
+# --------------------------------------------------------------------------- #
+
+CACHE_NAME = "prices_AAPL+MSFT_2026-01-01_2026-03-01.csv"
+
+
+def constant_frame(value: float, rows: int = 5) -> pd.DataFrame:
+    """A cleaned-looking table where every cell is ``value`` (so any mix-up shows at once)."""
+    index = pd.bdate_range("2026-01-01", periods=rows, name="Date")
+    # clean_prices gives the exact shape a cache read gives back (same index type and unit).
+    return clean_prices(pd.DataFrame({"AAPL": value, "MSFT": value + 0.25}, index=index))
+
+
+def test_each_cache_write_uses_a_different_temp_file(monkeypatch, tmp_path):
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(Path(src).name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(data.os, "replace", spy)
+    path = tmp_path / CACHE_NAME
+
+    for i in range(5):
+        data._write_cache(path, constant_frame(float(i)))
+
+    assert len(seen) == 5
+    assert len(set(seen)) == 5  # five writes, five different temp names
+    assert all(name.startswith(CACHE_NAME) and name.endswith(".tmp") for name in seen)
+    assert [f.name for f in tmp_path.iterdir()] == [CACHE_NAME]  # and nothing left behind
+
+
+def test_the_temp_file_is_in_the_same_folder_as_the_cache_file(monkeypatch, tmp_path):
+    folders = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        folders.append(Path(src).parent)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(data.os, "replace", spy)
+    data._write_cache(tmp_path / CACHE_NAME, constant_frame(1.0))
+    assert folders == [tmp_path]  # same folder, so the rename is atomic
+
+
+def test_many_threads_writing_the_same_cache_key_leave_one_valid_file(tmp_path):
+    path = tmp_path / CACHE_NAME
+    threads_n, writes_n, rows = 8, 20, 300  # 160 writes of a 300-row table
+    start_together = threading.Barrier(threads_n)
+    errors = []
+
+    def frame_for(thread: int, write: int) -> pd.DataFrame:
+        return constant_frame(thread * 1000 + write + 0.5, rows)
+
+    def worker(thread: int) -> None:
+        start_together.wait()
+        for write in range(writes_n):
+            try:
+                data._write_cache(path, frame_for(thread, write))
+            except BaseException as exc:  # noqa: BLE001 - we want to see anything at all
+                errors.append(exc)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pool = [threading.Thread(target=worker, args=(t,)) for t in range(threads_n)]
+        for thread in pool:
+            thread.start()
+        for thread in pool:
+            thread.join()
+
+    assert errors == []
+    assert [str(w.message) for w in caught] == []  # no "Could not write the price cache"
+
+    cached = data._read_cache(path, ["AAPL", "MSFT"])
+    assert cached is not None  # the file parses and has the right columns
+    value = cached.iloc[0, 0]
+    candidates = {t * 1000 + w + 0.5: (t, w) for t in range(threads_n) for w in range(writes_n)}
+    assert value in candidates  # the first cell is one of the values somebody wrote...
+    pd.testing.assert_frame_equal(cached, frame_for(*candidates[value]), check_exact=True)
+    # ...and the WHOLE table belongs to that one write (no mix of two writers).
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert [f.name for f in tmp_path.iterdir()] == [CACHE_NAME]
+
+
+def test_a_cache_write_that_fails_half_way_leaves_no_temp_file(monkeypatch, tmp_path):
+    def half_a_write(self, path_or_buf, *args, **kwargs):
+        Path(path_or_buf).write_text("Date,AAPL\n2026-01-0")  # the disk fills up here
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", half_a_write)
+
+    with pytest.warns(UserWarning, match="Could not write"):
+        data._write_cache(tmp_path / CACHE_NAME, constant_frame(1.0))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_rename_leaves_no_temp_file_and_keeps_the_old_cache(monkeypatch, tmp_path):
+    path = tmp_path / CACHE_NAME
+    data._write_cache(path, constant_frame(1.0))
+    before = path.read_bytes()
+
+    def broken_replace(src, dst):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(data.os, "replace", broken_replace)
+    with pytest.warns(UserWarning, match="Could not write"):
+        data._write_cache(path, constant_frame(2.0))
+
+    assert path.read_bytes() == before  # the old file is intact
+    assert [f.name for f in tmp_path.iterdir()] == [CACHE_NAME]
+
+
+def test_an_interrupt_during_a_cache_write_still_cleans_up_the_temp_file(monkeypatch, tmp_path):
+    def interrupted(self, path_or_buf, *args, **kwargs):
+        Path(path_or_buf).write_text("partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        data._write_cache(tmp_path / CACHE_NAME, constant_frame(1.0))
+    assert list(tmp_path.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# D12: prune_cache keeps the cache folder from growing forever
+# --------------------------------------------------------------------------- #
+
+DAY = 86400
+
+
+def make_file(folder: Path, name: str, age_seconds: float = 0, text: str = "x") -> Path:
+    """Create a file whose last-modified time is ``age_seconds`` ago."""
+    path = folder / name
+    path.write_text(text)
+    moment = time.time() - age_seconds
+    os.utime(path, (moment, moment))
+    return path
+
+
+def names(folder: Path) -> list[str]:
+    return sorted(p.name for p in folder.iterdir())
+
+
+def temp_name(cache_name: str) -> str:
+    """A temp file name the way ``_atomic_write`` makes one: cache name + random id + .tmp."""
+    return f"{cache_name}.{uuid.uuid4().hex}.tmp"
+
+
+def test_prune_deletes_price_files_older_than_max_age_days(tmp_path):
+    make_file(tmp_path, "prices_OLD_2020-01-01_2020-02-01.csv", 8 * DAY)
+    make_file(tmp_path, "prices_NEW_2020-01-01_2020-02-01.csv", 6 * DAY)
+    make_file(tmp_path, "prices_TODAY_2020-01-01_2020-02-01.csv", 0)
+
+    deleted = data.prune_cache(tmp_path)
+
+    assert deleted == 1
+    assert names(tmp_path) == [
+        "prices_NEW_2020-01-01_2020-02-01.csv",
+        "prices_TODAY_2020-01-01_2020-02-01.csv",
+    ]
+
+
+def test_prune_age_boundary_is_strict(tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 7 * DAY - 60)  # a minute younger
+    make_file(tmp_path, "prices_B_2020-01-01_2020-02-01.csv", 7 * DAY + 60)  # a minute older
+    assert data.prune_cache(tmp_path, max_age_days=7) == 1
+    assert names(tmp_path) == ["prices_A_2020-01-01_2020-02-01.csv"]
+
+
+def test_prune_custom_max_age(tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 2 * DAY)
+    make_file(tmp_path, "prices_B_2020-01-01_2020-02-01.csv", 0.5 * DAY)
+    assert data.prune_cache(tmp_path, max_age_days=1) == 1
+    assert names(tmp_path) == ["prices_B_2020-01-01_2020-02-01.csv"]
+
+
+def test_prune_keeps_the_newest_max_files_and_deletes_the_oldest(tmp_path):
+    for i in range(5):  # f0 is the oldest, f4 the newest, all well inside the age limit
+        make_file(tmp_path, f"prices_f{i}_2020-01-01_2020-02-01.csv", (5 - i) * 3600)
+
+    deleted = data.prune_cache(tmp_path, max_files=3)
+
+    assert deleted == 2
+    assert names(tmp_path) == [f"prices_f{i}_2020-01-01_2020-02-01.csv" for i in (2, 3, 4)]
+
+
+def test_prune_exactly_max_files_deletes_nothing(tmp_path):
+    for i in range(3):
+        make_file(tmp_path, f"prices_f{i}_2020-01-01_2020-02-01.csv", i * 3600)
+    assert data.prune_cache(tmp_path, max_files=3) == 0
+    assert len(names(tmp_path)) == 3
+
+
+def test_prune_applies_the_age_rule_first_then_the_count_rule(tmp_path):
+    make_file(tmp_path, "prices_ancient_2020-01-01_2020-02-01.csv", 30 * DAY)
+    for i in range(4):
+        make_file(tmp_path, f"prices_f{i}_2020-01-01_2020-02-01.csv", (4 - i) * 3600)
+
+    # 1 file is too old; of the 4 left, the oldest 2 go because max_files is 2.
+    assert data.prune_cache(tmp_path, max_files=2) == 3
+    assert names(tmp_path) == [f"prices_f{i}_2020-01-01_2020-02-01.csv" for i in (2, 3)]
+
+
+def test_prune_never_touches_other_files_or_folders(tmp_path):
+    old = 400 * DAY
+    keep = [
+        make_file(tmp_path, "notes.txt", old),
+        make_file(tmp_path, "other.csv", old),
+        make_file(tmp_path, "prices_wrong_extension.txt", old),
+        make_file(tmp_path, "myprices_A_2020-01-01_2020-02-01.csv", old),
+        make_file(tmp_path, "something.tmp", old),  # an old .tmp that is not ours
+        make_file(tmp_path, ".gitkeep", old),
+        # lookalikes of OUR names that are not names _cache_path can make (a user's own files)
+        make_file(tmp_path, "prices_my_q3_export.csv", old),
+        make_file(tmp_path, "prices_2024.csv", old),
+        make_file(tmp_path, "prices_AAPL_2020-01-01.csv", old),  # only one date
+        make_file(tmp_path, "prices_AAPL_2020-01-01_2020-02-01.csv.bak", old),
+        make_file(tmp_path, "prices_AAPL_2020-01-01_2020-02-01.csv.notes.tmp", old),  # tmp, but no id
+        make_file(tmp_path, "prices_AAPL_2020-01-01_2020-02-01.csv.tmp", old),
+        make_file(tmp_path, "prices_AAPL_2020-01-01_2020-02-01.csv.beef.tmp", old),  # id is not 32 hex
+        make_file(tmp_path, "Prices_AAPL_2020-01-01_2020-02-01.csv", old),  # capital P
+        make_file(tmp_path, "prices_AAPL_2020-01-01_2020-02-01.CSV", old),
+        make_file(tmp_path, "prices__2020-01-01_2020-02-01.csv", old),  # empty ticker part
+        make_file(tmp_path, "prices_AAPL MSFT_2020-01-01_2020-02-01.csv", old),  # a space
+    ]
+    folder = tmp_path / "prices_folder.csv"  # a FOLDER whose name looks like a cache file
+    folder.mkdir()
+    os.utime(folder, (time.time() - old, time.time() - old))
+    make_file(tmp_path, "prices_X_2020-01-01_2020-02-01.csv", old)  # the one that must go
+
+    deleted = data.prune_cache(tmp_path, max_age_days=1, max_files=0)
+
+    assert deleted == 1
+    assert all(path.exists() for path in keep)
+    assert folder.is_dir()
+    assert not (tmp_path / "prices_X_2020-01-01_2020-02-01.csv").exists()
+
+
+def test_prune_leaves_a_users_own_prices_file_alone_even_when_it_is_ancient(tmp_path):
+    mine = make_file(tmp_path, "prices_my_export.csv", 30 * DAY)
+    assert data.prune_cache(tmp_path) == 0
+    assert data.prune_cache(tmp_path, max_age_days=0, max_files=0) == 0
+    assert mine.exists()
+
+
+# The names prune_cache recognises are derived from what _cache_path really produces.
+CACHE_NAME_REQUESTS = [
+    ["AAPL"],
+    ["AAPL", "MSFT"],
+    ["MSFT", "AAPL"],
+    ["^GSPC"],
+    ["EURUSD=X"],
+    ["BRK-B"],
+    ["7203.T"],
+    ["^GSPC", "EURUSD=X", "BRK-B", "7203.T", "AAPL"],
+    [f"T{i:03d}" for i in range(40)],  # long: the name becomes a hash
+    ["BF.B", "A", "0700.HK", "^VIX", "GC=F"],
+]
+
+
+@pytest.mark.parametrize("tickers", CACHE_NAME_REQUESTS, ids=lambda t: "+".join(t)[:30])
+def test_every_name_cache_path_makes_is_recognised_by_prune(tmp_path, tickers):
+    path = data._cache_path(tmp_path, tickers, "2026-01-01", "2026-03-01")
+    assert data._CACHE_FILE_PATTERN.fullmatch(path.name), path.name
+    assert data._CACHE_TEMP_PATTERN.fullmatch(temp_name(path.name)), path.name
+    assert data._CACHE_TEMP_PATTERN.fullmatch(f"{path.name}.12345.tmp")  # the older, process-id style
+
+    old = make_file(tmp_path, path.name, 30 * DAY)
+    assert data.prune_cache(tmp_path) == 1  # and so it is pruned when it is old
+    assert not old.exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "prices_my_q3_export.csv",
+        "prices_2024.csv",
+        "notes.csv",
+        "prices_.csv",
+        "prices_AAPL_2026-01-01.csv",
+        "prices_AAPL_2026-1-1_2026-3-1.csv",
+        "prices_AAPL_2026-01-01_2026-03-01.csv.old",
+        "prices_AAPL_2026-01-01_2026-03-01.csv.tmp",
+        "xprices_AAPL_2026-01-01_2026-03-01.csv",
+        "prices_AAPL_2026-01-01_2026-03-01.csv\n",
+        "../prices_AAPL_2026-01-01_2026-03-01.csv",
+    ],
+)
+def test_names_that_cache_path_cannot_make_are_not_recognised(name):
+    assert data._CACHE_FILE_PATTERN.fullmatch(name) is None
+    assert data._CACHE_TEMP_PATTERN.fullmatch(name) is None
+
+
+def test_prune_does_not_follow_or_delete_links(tmp_path):
+    if os.utime not in os.supports_follow_symlinks:
+        pytest.skip("this platform cannot set the time of a link itself")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = make_file(elsewhere, "precious.txt", 400 * DAY)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    link = cache / "prices_link_2020-01-01_2020-02-01.csv"
+    link.symlink_to(target)
+    old = time.time() - 400 * DAY
+    os.utime(link, (old, old), follow_symlinks=False)
+
+    assert data.prune_cache(cache, max_age_days=1) == 0
+    assert link.is_symlink() and target.exists()
+
+
+def test_prune_deletes_stale_temp_files_but_not_fresh_ones(tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv.1234.tmp", 2 * 3600)  # old pid-style name
+    make_file(tmp_path, temp_name("prices_B_2020-01-01_2020-02-01.csv"), 3601)  # just over an hour
+    fresh = make_file(tmp_path, temp_name("prices_C_2020-01-01_2020-02-01.csv"), 3000)  # being written now
+
+    deleted = data.prune_cache(tmp_path)
+
+    assert deleted == 2
+    assert names(tmp_path) == [fresh.name]
+
+
+def test_prune_temp_files_do_not_count_towards_max_files(tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 100)
+    make_file(tmp_path, temp_name("prices_A_2020-01-01_2020-02-01.csv"), 100)  # fresh temp
+    assert data.prune_cache(tmp_path, max_files=1) == 0
+
+
+def test_prune_returns_zero_for_a_missing_or_empty_folder(tmp_path):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no warning for a folder that simply does not exist
+        assert data.prune_cache(tmp_path / "does_not_exist") == 0
+        assert data.prune_cache(tmp_path) == 0
+
+
+def test_prune_none_switches_a_rule_off(tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 400 * DAY)
+    make_file(tmp_path, "prices_B_2020-01-01_2020-02-01.csv", 0)
+    assert data.prune_cache(tmp_path, max_age_days=None, max_files=None) == 0
+    assert data.prune_cache(tmp_path, max_age_days=None, max_files=1) == 1  # only the count rule
+    assert names(tmp_path) == ["prices_B_2020-01-01_2020-02-01.csv"]
+
+
+@pytest.mark.parametrize("kwargs", [{"max_age_days": -1}, {"max_files": -1}])
+def test_prune_rejects_negative_limits(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="negative"):
+        data.prune_cache(tmp_path, **kwargs)
+
+
+def test_prune_default_folder_is_the_default_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "_default_cache_dir", lambda: tmp_path)
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 30 * DAY)
+    assert data.prune_cache() == 1
+
+
+def test_prune_default_limits_are_7_days_and_200_files(tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 6.9 * DAY)  # kept by the age rule
+    for i in range(200):
+        make_file(tmp_path, f"prices_n{i:03d}_2020-01-01_2020-02-01.csv", 10 + i)
+    assert data.prune_cache(tmp_path) == 1  # 201 files: exactly the oldest one goes
+    assert len(list(tmp_path.glob("prices_*.csv"))) == 200
+    assert not (tmp_path / "prices_A_2020-01-01_2020-02-01.csv").exists()
+
+
+def test_prune_is_best_effort_when_a_file_cannot_be_deleted(monkeypatch, tmp_path):
+    victim = make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 30 * DAY)
+
+    def refuse(self, missing_ok=False):
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.warns(UserWarning, match="Could not clean the price cache"):
+        assert data.prune_cache(tmp_path) == 0  # no exception, nothing counted
+    assert victim.exists()
+
+
+def test_prune_is_best_effort_when_the_folder_cannot_be_listed(monkeypatch, tmp_path):
+    def refuse(self):
+        raise PermissionError("cannot list")
+
+    monkeypatch.setattr(Path, "iterdir", refuse)
+    with pytest.warns(UserWarning, match="Could not clean the price cache"):
+        assert data.prune_cache(tmp_path) == 0
+
+
+def test_prune_ignores_a_file_that_another_request_already_deleted(monkeypatch, tmp_path):
+    make_file(tmp_path, "prices_A_2020-01-01_2020-02-01.csv", 30 * DAY)
+    real_unlink = Path.unlink
+
+    def somebody_else_got_there_first(self, missing_ok=False):
+        real_unlink(self)
+        raise FileNotFoundError(self.name)
+
+    monkeypatch.setattr(Path, "unlink", somebody_else_got_there_first)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # this is normal, not worth a warning
+        assert data.prune_cache(tmp_path) == 0
+
+
+def test_write_cache_itself_does_not_prune_and_says_whether_it_wrote(monkeypatch, tmp_path):
+    stale = make_file(tmp_path, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+
+    assert data._write_cache(tmp_path / CACHE_NAME, constant_frame(1.0)) is True
+    assert stale.exists()  # pruning is the caller's decision (see load_prices below)
+
+    monkeypatch.setattr(data.os, "replace", lambda src, dst: (_ for _ in ()).throw(OSError("no")))
+    with pytest.warns(UserWarning, match="Could not write"):
+        assert data._write_cache(tmp_path / "prices_OTHER_2026-01-01_2026-03-01.csv", constant_frame(1.0)) is False
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.fixture
+def default_cache(monkeypatch, tmp_path):
+    """Make tmp_path/default_cache the DEFAULT cache folder, so tests never touch the real one."""
+    folder = tmp_path / "default_cache"
+    folder.mkdir()
+    monkeypatch.setattr(data, "_default_cache_dir", lambda: folder)
+    return folder
+
+
+def test_load_prices_keeps_the_default_cache_folder_tidy(downloader, default_cache):
+    stale = make_file(default_cache, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+    recent = make_file(default_cache, "prices_RECENT_2020-01-01_2020-02-01.csv", 1 * DAY)
+
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01")  # cache_dir=None: the default folder
+
+    assert not stale.exists()
+    assert recent.exists()
+    assert (default_cache / CACHE_NAME).exists()  # the file just written is never pruned
+
+
+def test_load_prices_never_prunes_a_folder_the_caller_chose(downloader, default_cache, tmp_path):
+    mine = tmp_path / "my_folder"
+    mine.mkdir()
+    # Even a file with a name that matches our scheme and is ancient stays: it is not our folder.
+    old_scheme = make_file(mine, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+    old_default = make_file(default_cache, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01", cache_dir=mine)
+
+    assert old_scheme.exists()
+    assert old_default.exists()  # and the default folder was not cleaned either: it was not used
+    assert (mine / CACHE_NAME).exists()
+
+
+def test_a_users_own_prices_file_survives_load_prices_in_any_folder(downloader, default_cache, tmp_path):
+    mine = tmp_path / "my_folder"
+    mine.mkdir()
+    export = make_file(mine, "prices_my_export.csv", 30 * DAY)
+    export_default = make_file(default_cache, "prices_my_export.csv", 30 * DAY)
+    q3 = make_file(default_cache, "prices_my_q3_export.csv", 30 * DAY)
+
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01", cache_dir=mine)
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01")
+
+    assert export.exists() and export_default.exists() and q3.exists()
+    assert data.prune_cache(mine) == 0 and data.prune_cache(default_cache) == 0
+    assert export.exists() and export_default.exists() and q3.exists()
+
+
+def test_prune_cache_can_still_be_called_by_hand_on_a_folder_the_caller_chose(downloader, tmp_path):
+    mine = tmp_path / "my_folder"
+    mine.mkdir()
+    stale = make_file(mine, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01", cache_dir=mine)
+    assert stale.exists()
+    assert data.prune_cache(mine) == 1  # the explicit call does the work
+    assert not stale.exists()
+
+
+def test_a_failed_cache_write_does_not_prune_the_default_folder(downloader, default_cache, monkeypatch):
+    stale = make_file(default_cache, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+    monkeypatch.setattr(data.os, "replace", lambda src, dst: (_ for _ in ()).throw(OSError("no")))
+
+    with pytest.warns(UserWarning, match="Could not write"):
+        prices = load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01")
+    assert len(prices) == 3
+    assert stale.exists()
+
+
+def test_a_cache_hit_does_not_prune(downloader, default_cache):
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01")  # writes the cache file
+    stale = make_file(default_cache, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+
+    load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01")  # served from the cache: no write
+
+    assert len(downloader.calls) == 1
+    assert stale.exists()
+
+
+def test_a_pruning_problem_never_breaks_load_prices(downloader, default_cache, monkeypatch):
+    make_file(default_cache, "prices_STALE_2020-01-01_2020-02-01.csv", 30 * DAY)
+
+    def refuse(self, missing_ok=False):
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with pytest.warns(UserWarning, match="Could not clean"):
+        prices = load_prices(["AAPL", "MSFT"], "2026-01-01", "2026-03-01")
+    assert len(prices) == 3  # the prices still came back
+
+
+def test_the_temp_names_written_by_the_cache_match_the_prune_pattern(monkeypatch, tmp_path):
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(Path(src).name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(data.os, "replace", spy)
+    data._write_cache(tmp_path / CACHE_NAME, constant_frame(1.0))
+    assert len(seen) == 1 and data._CACHE_TEMP_PATTERN.fullmatch(seen[0])
+
+
+# --------------------------------------------------------------------------- #
+# market_today: today's date in New York
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "now_utc, expected",
+    [
+        ("2026-10-20 16:00", datetime.date(2026, 10, 20)),
+        ("2026-10-21 03:59:59", datetime.date(2026, 10, 20)),  # one second before New York midnight
+        ("2026-10-21 04:00", datetime.date(2026, 10, 21)),  # New York midnight (summer time)
+        ("2026-12-15 04:59", datetime.date(2026, 12, 14)),  # winter time: cut-over at 05:00 UTC
+        ("2026-12-15 05:00", datetime.date(2026, 12, 15)),
+    ],
+)
+def test_market_today_is_the_new_york_date(monkeypatch, now_utc, expected):
+    monkeypatch.setattr(data, "_today", REAL_TODAY_FUNCTION)  # undo the autouse pin
+    monkeypatch.setattr(data, "_now_utc", at_utc(now_utc))
+
+    result = data.market_today()
+
+    assert result == expected
+    assert type(result) is datetime.date  # a plain date: not a Timestamp, not a datetime
+
+
+def test_market_today_ignores_the_servers_own_timezone(monkeypatch):
+    # 16:00 UTC is already the 21st in Tokyo and still the 20th in New York.
+    monkeypatch.setattr(data, "_today", REAL_TODAY_FUNCTION)
+    monkeypatch.setattr(data, "_now_utc", at_utc("2026-10-20 16:00"))
+    assert data._now_utc().tz_convert("Asia/Tokyo").date() == datetime.date(2026, 10, 21)
+    assert data.market_today() == datetime.date(2026, 10, 20)
+
+
+def test_market_today_agrees_with_the_internal_today(pinned_today):
+    # With "today" pinned (autouse fixture), market_today follows it: one source of truth.
+    assert data.market_today() == pinned_today.date() == datetime.date(2026, 6, 15)
+
+
+def test_market_today_with_the_real_clock_is_within_a_day_of_the_utc_date(monkeypatch):
+    monkeypatch.setattr(data, "_today", REAL_TODAY_FUNCTION)  # undo the autouse pin
+    utc_date = pd.Timestamp.now(tz="UTC").date()
+    assert abs((data.market_today() - utc_date).days) <= 1

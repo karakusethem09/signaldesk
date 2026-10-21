@@ -15,26 +15,50 @@ The functions, from the network inward:
     find_gaps       -> report missing values (NaN cells) per ticker (pure, never fills)
     find_missing_days -> report weekdays that are absent from the table (pure)
     load_prices     -> the one the dashboard calls: cache -> download -> clean -> save
+
+Added for the public website (Phase 1.5):
+    load_demo       -> read the committed demo snapshot (data/demo/), fully offline
+    refresh_demo_snapshot -> rebuild that snapshot from Yahoo (run by scripts/refresh_demo_data.py)
+    prune_cache     -> delete old cache files so the cache folder cannot grow forever
+    market_today    -> today's date in New York (use it instead of the computer's clock)
 """
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import json
+import math
 import os
 import re
+import stat
+import time
+import uuid
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
+try:  # the "Yahoo is rate-limiting us" error; guarded in case a yfinance version lacks it
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:  # pragma: no cover
+    YFRateLimitError = None
+
 __all__ = [
+    "DemoData",
     "PriceDataError",
+    "ProviderUnavailableError",
     "clean_prices",
     "download_prices",
     "find_gaps",
     "find_missing_days",
+    "load_demo",
     "load_prices",
+    "market_today",
+    "prune_cache",
+    "refresh_demo_snapshot",
 ]
 
 
@@ -44,6 +68,17 @@ class PriceDataError(ValueError):
     It is a kind of ValueError, so ``except ValueError`` also catches it. The
     dashboard can show ``str(error)`` to the user because the message says what
     went wrong (for example which ticker came back empty).
+    """
+
+
+class ProviderUnavailableError(PriceDataError):
+    """Raised when NO ticker came back, which usually means Yahoo Finance is not answering.
+
+    It is a kind of PriceDataError, so existing ``except PriceDataError`` code still
+    catches it. We cannot tell "Yahoo is rate-limiting or down" apart from "none of these
+    symbols exist" (Yahoo answers both with an empty table), so the message names both
+    possibilities. When only SOME tickers are missing we raise a plain PriceDataError
+    instead, because then the provider clearly works and those symbols are the problem.
     """
 
 
@@ -86,6 +121,16 @@ def _today() -> pd.Timestamp:
     """
     new_york_now = _now_utc().tz_convert("America/New_York")
     return new_york_now.normalize().tz_localize(None)
+
+
+def market_today() -> datetime.date:
+    """Today's date in New York, as a plain ``datetime.date``.
+
+    The dashboard uses this for its date pickers instead of ``date.today()``. A server in
+    another timezone (Streamlit Cloud runs on UTC) would otherwise show a different "today"
+    than the one ``load_prices`` uses to cap the end date. See ``_today`` for the reasoning.
+    """
+    return _today().date()
 
 
 def _limit_end_to_today(end) -> tuple[pd.Timestamp, str]:
@@ -183,17 +228,69 @@ def _extract_close(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     raise PriceDataError("yfinance returned data without a 'Close' field.")
 
 
-def _require_all_tickers(prices: pd.DataFrame, tickers: list[str]) -> None:
+# DEFENSIVE CODE, not the main path. yfinance 1.7 catches EVERY exception per ticker inside
+# yf.download (multi.py, _download_one) and replaces that ticker's data with an empty table, so
+# a rate limit or a dropped connection normally does NOT come out of yf.download as an error:
+# it arrives as "no data for this ticker" and is handled by raw.empty / _require_all_tickers.
+# We still catch these errors in case another yfinance version lets them through. Network
+# errors from curl_cffi and requests are OSError subclasses, like the built-in
+# ConnectionError and TimeoutError.
+_PROVIDER_ERRORS = tuple(
+    t for t in (YFRateLimitError, OSError) if t is not None
+)
+# OSError subclasses that mean "a file or folder on this computer", not "the network".
+_LOCAL_FILE_ERRORS = (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)
+
+
+def _describe_window(start: str, end: str) -> str:
+    """" between 2026-10-17 and 2026-10-18" for a request from start up to (excluding) end.
+
+    ``end`` is excluded by the downloader, but a person thinks of the last day as included,
+    so the message names the last day that was actually asked for (the day before ``end``).
+    """
+    last = (pd.Timestamp(end) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    return f" on {start}" if last == start else f" between {start} and {last}"
+
+
+def _no_data_for_any_ticker(tickers: list[str], window: str = "") -> ProviderUnavailableError:
+    """The error for "nothing at all came back". ``window`` is an optional " between X and Y".
+
+    There are three honest explanations and we cannot tell them apart, so the message names
+    all three: the provider is rate-limiting or down, the symbols do not exist, or the dates
+    contain no trading days (a weekend or a market holiday gives an empty table too).
+    """
+    one = len(tickers) == 1
+    return ProviderUnavailableError(
+        f"No price data came back for any of the requested tickers ({', '.join(tickers)})"
+        f"{window}. The data provider may be rate-limiting or unavailable right now "
+        f"(try again later), the {'symbol' if one else 'symbols'} may not exist, or there "
+        "were no trading days in that period (for example a weekend or a market holiday)."
+    )
+
+
+def _require_all_tickers(prices: pd.DataFrame, tickers: list[str], window: str = "") -> None:
     """Raise PriceDataError if any requested ticker is absent or has only missing values.
 
     yfinance does not raise for an unknown ticker: it just hands back an empty
     (all-NaN) column. We turn that into a loud error instead of passing it on.
+    If EVERY ticker is empty the error is the more specific ProviderUnavailableError
+    (the provider is probably rate-limiting us, or the dates have no trading days);
+    if only some are, it names those. ``window`` is an optional " between X and Y".
+
+    The partial case is honest about its two causes. yfinance hides a rate limit on ONE
+    ticker as "no data for that ticker", so we cannot tell it from a mistyped symbol.
     """
     empty = [t for t in tickers if t not in prices.columns or prices[t].isna().all()]
+    if len(empty) == len(tickers):
+        raise _no_data_for_any_ticker(tickers, window)
     if empty:
+        one = len(empty) == 1
         raise PriceDataError(
-            f"No price data returned for: {', '.join(empty)}. "
-            "Check the ticker symbol(s) and the date range, and your internet connection."
+            f"No price data returned for: {', '.join(empty)}{window}. "
+            f"The {'symbol' if one else 'symbols'} may not exist or may not have traded in "
+            f"this period, or the data provider may have failed for "
+            f"{'it' if one else 'them'} (for example a rate limit). "
+            "Check the symbol(s) and the date range, or try again in a minute."
         )
 
 
@@ -208,6 +305,21 @@ def _cache_path(cache_dir, tickers: list[str], start: str, end: str) -> Path:
     if len(slug) > 80:
         slug = hashlib.sha1("+".join(ordered).encode("utf-8")).hexdigest()[:16]
     return Path(cache_dir) / f"prices_{slug}_{start}_{end}.csv"
+
+
+# The names ``_cache_path`` can produce, as patterns. ``prune_cache`` deletes ONLY files whose
+# whole name matches one of these, so a file somebody else put in the folder (for example
+# "prices_my_q3_export.csv") is never touched. The pieces, matching ``_cache_path`` above:
+#   prices_<slug>_<start>_<end>.csv   <slug> = tickers joined with "+", every character other
+#                                      than A-Z a-z 0-9 . _ - replaced by "_" (or a 16-char
+#                                      hash, which these characters also cover)
+#   <that name>.<32 hex>.tmp          the temporary file of ``_atomic_write`` (a random id)
+#   <that name>.<digits>.tmp          the older temporary name (process id), if one was left
+_DATE_PATTERN = r"\d{4}-\d{2}-\d{2}"
+_CACHE_FILE_PATTERN = re.compile(rf"prices_[A-Za-z0-9._+\-]+_{_DATE_PATTERN}_{_DATE_PATTERN}\.csv")
+_CACHE_TEMP_PATTERN = re.compile(
+    rf"prices_[A-Za-z0-9._+\-]+_{_DATE_PATTERN}_{_DATE_PATTERN}\.csv\.(?:[0-9a-f]{{32}}|[0-9]+)\.tmp"
+)
 
 
 def _read_cache(path: Path, tickers: list[str]) -> pd.DataFrame | None:
@@ -226,23 +338,123 @@ def _read_cache(path: Path, tickers: list[str]) -> pd.DataFrame | None:
     return cached.reindex(columns=tickers)  # follow the caller's ticker order
 
 
-def _write_cache(path: Path, prices: pd.DataFrame) -> None:
+def _atomic_write(path: Path, write) -> None:
+    """Create ``path`` safely: write a temporary file next to it, then rename it into place.
+
+    ``write`` is a function that receives the temporary path and writes the content there.
+    The rename (``os.replace``) is all-or-nothing, so a reader sees either the old file or
+    the complete new one, never half a file, and a crash cannot leave a broken file behind.
+
+    The temporary name contains a random id, so two writers (threads or processes) never
+    share a temporary file, even when they save the same ``path`` at the same moment. The
+    temporary file is removed if anything goes wrong. Errors are raised to the caller.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    except BaseException:  # also Ctrl+C: never leave a half-written temp file around
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # cleanup is best-effort: the original error is what matters
+        raise
+
+
+def _write_cache(path: Path, prices: pd.DataFrame) -> bool:
     """Save prices to the cache as CSV. A failure here warns but never stops the dashboard.
 
-    We write to a temporary file first and then rename it, so a crash half-way
-    through cannot leave a broken cache file behind.
+    We write to a unique temporary file first and then rename it (see ``_atomic_write``).
+    Returns True if the file was written, False if the write failed (after the warning).
+    Pruning old files is NOT done here: ``load_prices`` does it, and only for the default folder.
     """
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        prices.to_csv(tmp)
-        os.replace(tmp, path)
+        _atomic_write(path, prices.to_csv)
     except OSError as exc:
         warnings.warn(f"Could not write the price cache at {path} ({exc}). Continuing without it.")
+        return False
+    return True
+
+
+STALE_TEMP_SECONDS = 3600  # a leftover cache temp file older than this is from a crashed writer
+
+
+def prune_cache(cache_dir=None, max_age_days: float | None = 7, max_files: int | None = 200) -> int:
+    """Delete old cache files and return how many were deleted.
+
+    Why: every different set of tickers and dates makes a new cache file, and on a public
+    server nobody would ever clean them up. Rules, in this order:
+      1. a cache file whose last-modified time is older than ``max_age_days`` is deleted;
+      2. of the files that are left, the OLDEST ones beyond ``max_files`` are deleted;
+      3. a leftover cache temp file (from a writer that crashed) older than an hour is
+         deleted. Younger ones are kept: somebody may be writing them right now.
+    A "cache file" is a file whose WHOLE name is one that ``_cache_path`` can produce, for
+    example ``prices_AAPL+MSFT_2026-01-01_2026-03-01.csv``. It never touches any other file,
+    folder or link, even one called ``prices_something.csv``. It is best-effort: if something
+    cannot be deleted it only warns, it never raises or stops the dashboard.
+    ``None`` switches the age rule or the count rule off. ``cache_dir`` defaults to
+    ``data/cache`` in the project. (``load_prices`` calls this by itself only for that
+    default folder; for any other folder you call it yourself.)
+    """
+    if (max_age_days is not None and max_age_days < 0) or (max_files is not None and max_files < 0):
+        raise ValueError("max_age_days and max_files must not be negative.")
+    folder = Path(_default_cache_dir() if cache_dir is None else cache_dir)
+
+    deleted = 0
+    failures: list[str] = []
+
+    def delete(path: Path) -> None:
+        nonlocal deleted
         try:
-            tmp.unlink(missing_ok=True)  # tidy up a half-written temp file, if there is one
-        except OSError:
-            pass  # cleanup is best-effort: the warning above is what matters
+            path.unlink()
+            deleted += 1
+        except FileNotFoundError:
+            pass  # another request pruned it first: fine, the goal is reached
+        except OSError as exc:
+            failures.append(f"{path.name} ({exc})")
+
+    def regular_files(pattern: re.Pattern) -> list[tuple[float, str, Path]]:
+        """(modified time, name, path) of the regular files whose whole name matches ``pattern``
+        (no folders, no links)."""
+        found = []
+        for path in folder.iterdir():
+            if pattern.fullmatch(path.name) is None:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue  # vanished while we looked
+            if stat.S_ISREG(info.st_mode):
+                found.append((info.st_mtime, path.name, path))
+        return sorted(found)  # oldest first; equal times fall back to the name
+
+    try:
+        if not folder.is_dir():
+            return 0
+        now = time.time()
+        csv_files = regular_files(_CACHE_FILE_PATTERN)
+
+        if max_age_days is not None:
+            cutoff = now - max_age_days * 86400
+            for item in [f for f in csv_files if f[0] < cutoff]:
+                delete(item[2])
+            csv_files = [f for f in csv_files if f[0] >= cutoff]
+        if max_files is not None and len(csv_files) > max_files:
+            for item in csv_files[: len(csv_files) - max_files]:
+                delete(item[2])
+
+        for mtime, _name, path in regular_files(_CACHE_TEMP_PATTERN):
+            if now - mtime > STALE_TEMP_SECONDS:
+                delete(path)
+    except OSError as exc:
+        failures.append(f"{folder} ({exc})")
+
+    if failures:
+        warnings.warn(
+            f"Could not clean the price cache: {'; '.join(failures[:3])}. Continuing anyway."
+        )
+    return deleted
 
 
 # --------------------------------------------------------------------------- #
@@ -256,24 +468,43 @@ def download_prices(tickers: list[str], start, end) -> pd.DataFrame:
     dates as the index. It is NOT cleaned yet (use ``clean_prices`` for that).
     ``start`` is included but ``end`` is excluded (that is how yfinance works).
     Raises ValueError for bad inputs and PriceDataError if any ticker has no data.
+    If NO ticker has data it raises ProviderUnavailableError, a kind of PriceDataError. Its
+    message names every possible cause: the provider is rate-limiting or down, the symbols do
+    not exist, or the dates contain no trading days (a weekend, a holiday).
+
+    What yfinance really does (version 1.7): it catches every error PER TICKER and returns an
+    empty table for that ticker instead of raising. So a rate limit, a dropped connection, a
+    wrong symbol and even a local problem inside yfinance (its own cache database being
+    locked, for example) all look the same to us: "no data for this ticker". We cannot tell
+    them apart, so when only some tickers are missing the PriceDataError names them and says
+    both likely causes. (An error that does come out of yf.download is still turned into a
+    ProviderUnavailableError, except errors about files on this computer, which are re-raised.)
     """
     tickers, start_str, end_str = _validate_inputs(tickers, start, end)
+    window = _describe_window(start_str, end_str)
 
-    raw = yf.download(
-        tickers,
-        start=start_str,
-        end=end_str,
-        auto_adjust=True,  # "Close" is then already the split/dividend adjusted close
-        progress=False,
-    )
-    if raw is None or raw.empty:
-        raise PriceDataError(
-            f"No price data returned for {', '.join(tickers)} between {start_str} and "
-            f"{end_str}. Check the ticker symbol(s), the dates and your internet connection."
+    try:
+        raw = yf.download(
+            tickers,
+            start=start_str,
+            end=end_str,
+            auto_adjust=True,  # "Close" is then already the split/dividend adjusted close
+            progress=False,
         )
+    except _PROVIDER_ERRORS as exc:
+        if isinstance(exc, _LOCAL_FILE_ERRORS):
+            raise  # a problem on THIS computer (for example a folder we cannot open), not Yahoo
+        # Keep the message plain (it may be shown to a website visitor); the original
+        # error stays attached as __cause__ for whoever debugs it.
+        raise ProviderUnavailableError(
+            f"No price data could be fetched for {', '.join(tickers)}{window}. The data "
+            "provider may be rate-limiting or unreachable right now. Please try again later."
+        ) from exc
+    if raw is None or raw.empty:
+        raise _no_data_for_any_ticker(tickers, window)
 
     close = _extract_close(raw, tickers)
-    _require_all_tickers(close, tickers)
+    _require_all_tickers(close, tickers, window)
     return close.reindex(columns=tickers)
 
 
@@ -426,7 +657,9 @@ def load_prices(
 
     ``cache_dir`` defaults to ``data/cache`` inside the project folder, wherever you
     run the program from; pass a path to use another folder. ``use_cache=False`` forces
-    a fresh download and refreshes the cache file.
+    a fresh download and refreshes the cache file. After a successful write to the DEFAULT
+    folder, old cache files there are pruned (see ``prune_cache``); a folder you pass
+    yourself is never cleaned automatically, because it may hold your own files.
     Raises ValueError for bad inputs and PriceDataError if a ticker has no data.
     Gaps are kept as NaN: call ``find_gaps`` on the result to see them, and
     ``find_missing_days`` to see weekdays that are absent altogether.
@@ -434,7 +667,8 @@ def load_prices(
     end_ts, end_note = _limit_end_to_today(end)  # a bad/missing end raises ValueError here
     tickers, start_str, end_str = _validate_inputs(tickers, start, end_ts, end_note)
 
-    if cache_dir is None:
+    using_default_folder = cache_dir is None
+    if using_default_folder:
         cache_dir = _default_cache_dir()
     path = _cache_path(cache_dir, tickers, start_str, end_str)
 
@@ -448,8 +682,274 @@ def load_prices(
         raise PriceDataError(
             f"No price rows for {', '.join(tickers)} between {start_str} and {end_str}."
         )
-    _require_all_tickers(prices, tickers)
+    _require_all_tickers(prices, tickers, _describe_window(start_str, end_str))
     prices = prices.reindex(columns=tickers)
 
-    _write_cache(path, prices)
+    if _write_cache(path, prices) and using_default_folder:
+        prune_cache(cache_dir)  # keeps OUR cache folder from growing forever
     return prices
+
+
+# --------------------------------------------------------------------------- #
+# The demo snapshot (the public website's default data, no network needed)
+# --------------------------------------------------------------------------- #
+#
+# Yahoo Finance often blocks or rate-limits servers shared by many users, so the public
+# site cannot depend on it. Instead we save one snapshot of prices in git (data/demo/)
+# and the site reads that. Three files live there:
+#     demo_portfolio.json  hand-written: name, holdings (ticker -> weight), benchmark, years
+#     demo_prices.csv      the prices, same CSV format as the cache
+#     demo_meta.json       facts about the snapshot: first/last date, rows, tickers, source
+# ``refresh_demo_snapshot`` (run by scripts/refresh_demo_data.py) writes the last two from
+# the first one. ``load_demo`` reads all three and never touches the network.
+
+DEMO_CONFIG_FILE = "demo_portfolio.json"
+DEMO_PRICES_FILE = "demo_prices.csv"
+DEMO_META_FILE = "demo_meta.json"
+
+
+def _default_demo_dir() -> Path:
+    """The default demo folder: ``data/demo`` inside the project, wherever you run from."""
+    return Path(__file__).resolve().parent.parent / "data" / "demo"
+
+
+@dataclass(frozen=True, eq=False)
+class DemoData:
+    """Everything the dashboard needs to show the demo portfolio.
+
+    prices     cleaned adjusted closes, exactly the shape ``load_prices`` returns: a
+               DatetimeIndex named "Date", float64, one column per holding (in the order of
+               the config) followed by the benchmark column
+    holdings   ticker -> weight, as written in the config (the weights are NOT checked here;
+               ``risk.portfolio_value`` validates them when they are used)
+    benchmark  the benchmark ticker, for example "SPY"
+    name       a display name for the portfolio
+    as_of      the last date in the data
+    start      the first date in the data
+    source     where the prices came from, as text for the page footer
+
+    Frozen (you cannot assign to its fields). ``eq=False`` keeps the default "same object"
+    comparison, because comparing two DataFrames with ``==`` does not give a yes/no answer.
+    """
+
+    prices: pd.DataFrame
+    holdings: dict[str, float]
+    benchmark: str
+    name: str
+    as_of: pd.Timestamp
+    start: pd.Timestamp
+    source: str
+
+
+def _read_json_object(path: Path) -> dict:
+    """Read a JSON file that must contain an object. Any problem becomes a clear ValueError."""
+    hint = "Run `python scripts/refresh_demo_data.py` to rebuild the demo files."
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ValueError(f"The demo file {path.name} is missing (looked in {path.parent}). {hint}") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"The demo file {path.name} cannot be read ({exc}).") from exc
+    try:
+        content = json.loads(text)
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+        raise ValueError(f"The demo file {path.name} is not valid JSON ({exc}).") from exc
+    if not isinstance(content, dict):
+        raise ValueError(f"The demo file {path.name} must contain a JSON object, not {type(content).__name__}.")
+    return content
+
+
+def _is_number(value) -> bool:
+    """True for a real, finite number (not a bool, not NaN, not infinity, not text)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _demo_symbol(value, what: str) -> str:
+    """A ticker from the demo config: non-empty text, stripped and upper-case."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{DEMO_CONFIG_FILE}: {what} must be a non-empty ticker symbol, got {value!r}.")
+    return value.strip().upper()
+
+
+def _read_demo_config(folder: Path, require_years: bool = False) -> dict:
+    """Read and check demo_portfolio.json. Returns name, holdings, benchmark and years.
+
+    It checks the SHAPE (names are text, weights are numbers), not the weights' math.
+    ``years`` is only needed to rebuild the snapshot, so it is optional unless asked for.
+    """
+    config = _read_json_object(folder / DEMO_CONFIG_FILE)
+
+    name = config.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{DEMO_CONFIG_FILE}: 'name' must be non-empty text.")
+
+    raw_holdings = config.get("holdings")
+    if not isinstance(raw_holdings, dict) or not raw_holdings:
+        raise ValueError(f"{DEMO_CONFIG_FILE}: 'holdings' must be an object like {{\"AAPL\": 0.5, ...}}.")
+    holdings: dict[str, float] = {}
+    for raw_symbol, weight in raw_holdings.items():
+        symbol = _demo_symbol(raw_symbol, "a holding name")
+        if symbol in holdings:
+            raise ValueError(f"{DEMO_CONFIG_FILE}: holding {symbol} appears twice.")
+        if not _is_number(weight):
+            raise ValueError(f"{DEMO_CONFIG_FILE}: the weight of {symbol} must be a number, got {weight!r}.")
+        holdings[symbol] = float(weight)
+
+    benchmark = _demo_symbol(config.get("benchmark"), "'benchmark'")
+    if benchmark in holdings:
+        raise ValueError(f"{DEMO_CONFIG_FILE}: the benchmark {benchmark} must not also be a holding.")
+
+    years = config.get("years")
+    if years is None:
+        if require_years:
+            raise ValueError(f"{DEMO_CONFIG_FILE}: 'years' (how much history to keep) is required.")
+    elif not _is_number(years) or years <= 0:
+        raise ValueError(f"{DEMO_CONFIG_FILE}: 'years' must be a number above zero, got {years!r}.")
+
+    return {"name": name.strip(), "holdings": holdings, "benchmark": benchmark, "years": years}
+
+
+def _read_demo_prices(path: Path, expected_columns: list[str]) -> pd.DataFrame:
+    """Read demo_prices.csv and check it holds exactly the expected tickers, in that order."""
+    hint = "Run `python scripts/refresh_demo_data.py` to rebuild the demo files."
+    try:
+        # round_trip: the exact same reader setting the cache uses, so prices are bit-exact.
+        raw = pd.read_csv(path, index_col=0, parse_dates=True, float_precision="round_trip")
+        prices = clean_prices(raw)
+    except FileNotFoundError:
+        raise ValueError(f"The demo file {path.name} is missing (looked in {path.parent}). {hint}") from None
+    except (OSError, ValueError, TypeError, KeyError) as exc:  # includes pandas' parser errors
+        raise ValueError(f"The demo file {path.name} cannot be read as a price table ({exc}).") from exc
+
+    if prices.empty:
+        raise ValueError(f"The demo file {path.name} contains no price rows.")
+    missing = [c for c in expected_columns if c not in prices.columns]
+    unexpected = [c for c in prices.columns if c not in expected_columns]
+    if missing or unexpected:
+        raise ValueError(
+            f"The demo file {path.name} does not match {DEMO_CONFIG_FILE}: "
+            f"missing columns {missing or 'none'}, unexpected columns {unexpected or 'none'}. {hint}"
+        )
+    prices = prices.reindex(columns=expected_columns)  # config order, whatever the file's order
+    empty = [c for c in prices.columns if prices[c].isna().all()]
+    if empty:
+        raise ValueError(f"The demo file {path.name} has no prices at all for: {', '.join(empty)}.")
+    return prices
+
+
+def _check_demo_meta(meta: dict, prices: pd.DataFrame) -> str:
+    """Make sure demo_meta.json describes the CSV next to it. Returns the ``source`` text.
+
+    If someone refreshed only one of the files (or edited one by hand), the page would show
+    a wrong "data as of" date. A loud error is better than a quietly wrong date.
+    """
+    hint = "The demo files are out of sync. Run `python scripts/refresh_demo_data.py` again."
+    source = meta.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError(f"{DEMO_META_FILE}: 'source' must be non-empty text.")
+
+    def day(key: str) -> pd.Timestamp:
+        value = meta.get(key)
+        try:
+            if not isinstance(value, str):
+                raise ValueError("not text")
+            return pd.Timestamp(value).normalize()
+        except (ValueError, TypeError):
+            raise ValueError(f"{DEMO_META_FILE}: '{key}' must be a date like '2026-01-31', got {value!r}.") from None
+
+    for key, actual in (("as_of", prices.index.max()), ("start", prices.index.min())):
+        if day(key) != actual:
+            raise ValueError(
+                f"{DEMO_META_FILE} says {key} is {day(key):%Y-%m-%d} but {DEMO_PRICES_FILE} says "
+                f"{actual:%Y-%m-%d}. {hint}"
+            )
+    rows = meta.get("rows")
+    if isinstance(rows, bool) or rows != len(prices):
+        raise ValueError(f"{DEMO_META_FILE} says {rows!r} rows but {DEMO_PRICES_FILE} has {len(prices)}. {hint}")
+    tickers = meta.get("tickers")
+    if tickers != list(prices.columns):
+        raise ValueError(
+            f"{DEMO_META_FILE} lists tickers {tickers!r} but {DEMO_PRICES_FILE} has "
+            f"{list(prices.columns)!r}. {hint}"
+        )
+    return source.strip()
+
+
+def load_demo(demo_dir=None) -> DemoData:
+    """Load the committed demo snapshot. Fully offline: it only reads three small files.
+
+    ``demo_dir`` defaults to ``data/demo`` inside the project, wherever you run from.
+    The prices come back in the same shape ``load_prices`` returns (DatetimeIndex named
+    "Date", float64), with the holdings in config order and the benchmark as the last column.
+
+    Raises ValueError (with a message that says which file and what is wrong) if a file is
+    missing or malformed, if the CSV's columns are not exactly the holdings plus the
+    benchmark, or if demo_meta.json does not describe the CSV. It does NOT check that the
+    weights add up to 1: whoever uses the weights (``risk.portfolio_value``) does that.
+    """
+    folder = Path(_default_demo_dir() if demo_dir is None else demo_dir)
+    config = _read_demo_config(folder)
+    meta = _read_json_object(folder / DEMO_META_FILE)
+    holdings, benchmark = config["holdings"], config["benchmark"]
+
+    prices = _read_demo_prices(folder / DEMO_PRICES_FILE, list(holdings) + [benchmark])
+    source = _check_demo_meta(meta, prices)
+
+    return DemoData(
+        prices=prices,
+        holdings=dict(holdings),
+        benchmark=benchmark,
+        name=config["name"],
+        as_of=prices.index.max(),
+        start=prices.index.min(),
+        source=source,
+    )
+
+
+def _demo_window(years: float) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """(start, end) for a snapshot of ``years`` years. ``end`` is New York's today, EXCLUDED.
+
+    Excluding today means the last row is the last COMPLETE trading day, never an unfinished
+    day (the same rule ``load_prices`` follows).
+    """
+    end = _today()
+    if float(years).is_integer():
+        start = end - pd.DateOffset(years=int(years))  # exactly N calendar years back
+    else:
+        start = end - pd.Timedelta(days=round(years * 365.25))
+    return start.normalize(), end
+
+
+def refresh_demo_snapshot(demo_dir=None) -> dict:
+    """Download fresh prices for the demo portfolio and rewrite the snapshot files.
+
+    Reads ``demo_portfolio.json``, downloads the holdings plus the benchmark (always from
+    the network, never from the cache), cleans the table and writes ``demo_prices.csv`` and
+    ``demo_meta.json``. Returns the metadata it wrote. If the download fails, nothing is
+    written and the old snapshot stays as it was. Run it with scripts/refresh_demo_data.py.
+    """
+    folder = Path(_default_demo_dir() if demo_dir is None else demo_dir)
+    config = _read_demo_config(folder, require_years=True)
+    tickers = list(config["holdings"]) + [config["benchmark"]]
+    start, end = _demo_window(config["years"])
+
+    prices = clean_prices(download_prices(tickers, start, end))
+    if prices.empty:
+        raise PriceDataError(f"No price rows for {', '.join(tickers)} between {start:%Y-%m-%d} and {end:%Y-%m-%d}.")
+    _require_all_tickers(prices, tickers, _describe_window(f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"))
+    prices = prices.reindex(columns=tickers)
+
+    meta = {
+        "as_of": f"{prices.index.max():%Y-%m-%d}",
+        "start": f"{prices.index.min():%Y-%m-%d}",
+        "rows": int(len(prices)),
+        "tickers": tickers,
+        "source": f"Yahoo Finance via yfinance {yf.__version__}, adjusted close",
+        "created_at": _now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _atomic_write(folder / DEMO_PRICES_FILE, prices.to_csv)
+    _atomic_write(
+        folder / DEMO_META_FILE,
+        lambda tmp: tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8"),
+    )
+    return meta
