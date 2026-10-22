@@ -3,12 +3,19 @@
 **A small Bloomberg-style portfolio risk dashboard, built by a team of AI agents with a skeptical
 reviewer that checks every line before it is committed.**
 
-![SignalDesk dashboard: metrics table and growth chart](docs/images/dashboard-hero.png)
-<sub>Top of the dashboard. [Full screenshot](docs/images/dashboard.png), including the rolling volatility chart and the correlation heatmap.</sub>
+[![tests](https://github.com/karakusethem09/signaldesk/actions/workflows/tests.yml/badge.svg)](https://github.com/karakusethem09/signaldesk/actions/workflows/tests.yml)
 
-SignalDesk shows how a handful of stocks performed and how risky they were: annualized return,
-volatility, Sharpe ratio, max drawdown, Value at Risk, rolling volatility and correlations. All of
-it is calculated by our own tested Python functions.
+![SignalDesk dashboard: demo portfolio vs SPY](docs/images/dashboard-hero.png)
+<sub>The demo portfolio vs SPY over 5 years. More screenshots: [Overview](docs/images/dashboard.png) · [Risk (drawdown, rolling volatility)](docs/images/dashboard-risk.png) · [Holdings table](docs/images/dashboard-holdings.png).</sub>
+
+SignalDesk shows how a portfolio performed and how risky it was, side by side with a benchmark:
+- annualized return, volatility and the Sharpe ratio
+- max drawdown and Value at Risk
+- rolling volatility and correlations
+
+It opens on a **demo portfolio** (six US large caps vs SPY, 5 years) that works even when the data
+provider is down. You can also build your own portfolio from live Yahoo Finance data. Every number is
+calculated by our own tested Python functions.
 
 The dashboard is the vehicle. **What I actually wanted to learn is how AI agents can work together
 reliably.** So I didn't write the code myself. I designed a small team of AI agents, gave each one
@@ -23,7 +30,8 @@ I wrote the project rules ([`CLAUDE.md`](CLAUDE.md)) and the agent roles
 ([`.claude/agents/`](.claude/agents/)). Then I gave [Claude Code](https://claude.com/claude-code)
 one prompt: act as the **supervisor**, build Phase 1 by delegating, and don't
 write any code yourself. The [session journal](docs/sessions/2026-10-20-overnight-build.md) has the
-full prompt and the morning report.
+full prompt and the morning report. Phase 1.5, which made it a public website, followed the same process:
+[session 2 journal](docs/sessions/2026-10-21-phase-1-5-public-website.md).
 
 ```mermaid
 flowchart LR
@@ -36,9 +44,9 @@ flowchart LR
 | Agent | Model | Job | Can edit code? |
 |---|---|---|---|
 | Supervisor | Claude Opus | Plans, writes precise tasks, makes judgment calls, keeps the log, commits | No (by instruction) |
-| `data-engineer` | Claude Sonnet | Downloads, cleans and caches prices: [`signaldesk/data.py`](signaldesk/data.py) | Yes |
+| `data-engineer` | Claude Sonnet | Downloads, cleans and caches prices; demo snapshot; request limits: [`signaldesk/data.py`](signaldesk/data.py), [`signaldesk/limits.py`](signaldesk/limits.py) | Yes |
 | `quant-dev` | Claude Sonnet | All the math: [`signaldesk/risk.py`](signaldesk/risk.py) | Yes |
-| `dashboard-dev` | Claude Sonnet | The Streamlit UI: [`app.py`](app.py), with no math allowed | Yes |
+| `dashboard-dev` | Claude Sonnet | The Streamlit UI: [`app.py`](app.py) and [`ui/`](ui/), with no math allowed | Yes |
 | `risk-reviewer` | Claude Opus | Re-checks numbers by hand, tests on real data, plants bugs to test the tests | **No, read-only** |
 
 **The rules that make it work:**
@@ -76,6 +84,16 @@ planted 16 realistic display bugs (a drawdown shown as "−28.4%", a percentage 
 reversed heatmap colours), **13 of them passed every test**. After the fix, all 16 are caught.
 → [C2](docs/catch-log.md#c2-tests-checked-that-the-page-ran-not-what-it-showed)
 
+**And in Phase 1.5, while making it public:**
+- **A page reload reset the visitor rate limit.** A script could have sent about 1,000 Yahoo downloads
+  an hour and had the server blocked for everyone. There is now a site-wide cap.
+  → [C19](docs/catch-log.md#c19-reloading-the-page-reset-the-rate-limit)
+- **The 10-year limit would have refused a "10Y" button on every single day,** because of leap days.
+  The reviewer found it by checking all 2,922 days from 2026 to 2033.
+  → [C14](docs/catch-log.md#c14-the-10-year-limit-refused-10y-every-day)
+- **A late-starting holding silently shortened the portfolio,** so one year of portfolio would have
+  been compared with five years of SPY. → [C18](docs/catch-log.md#c18-a-late-starting-holding-silently-shortened-the-portfolio)
+
 Every catch is written up with its evidence, its fix and the lesson in the **[catch log](docs/catch-log.md)**.
 
 ---
@@ -106,20 +124,29 @@ Every catch is written up with its evidence, its fix and the lesson in the **[ca
 
 ## Features
 
-- **Metrics table:**
-  - annualized return, annualized volatility, Sharpe ratio, max drawdown and 1-day 95% VaR, per ticker
-  - short samples flagged with ⚠
-  - tickers that can't be computed are shown as "—", with the reason
-- **Charts:**
-  - growth of $1
-  - rolling volatility (choose the window)
-  - correlation heatmap
-- **Warnings shown on the page:**
-  - short samples
-  - gaps in the data, with "likely missing data" when a gap is longer than a holiday
-  - skipped tickers
-- **Data quality panel:** blank cells per ticker, and weekdays with no data (mostly market holidays).
-- **Any Yahoo Finance ticker** for stocks and ETFs, including non-US exchanges.
+- **Two modes:**
+  - **Demo portfolio (default):** AAPL, MSFT, NVDA, JPM, XOM and JNJ vs SPY, from a committed 5-year
+    snapshot. It works offline and opens instantly.
+  - **Custom (live data):** type your own holdings and weights (in %) and a benchmark, then press
+    *Run analysis*. Nothing is downloaded before that.
+- **Key numbers:** annualized return, volatility, Sharpe ratio, max drawdown and 1-day 95% VaR for
+  the portfolio, with the benchmark's value under each, **measured over the same dates**.
+- **Tabs:**
+  - **Overview:** growth of $1 (buy-and-hold).
+  - **Risk:** the drawdown ("underwater") curve and rolling volatility.
+  - **Correlation:** a heatmap.
+  - **Holdings:** a per-ticker table.
+  - **Data:** data quality.
+  - **About:** how it was built.
+- **Honest warnings on the page:**
+  - short samples (⚠ below 60 trading days)
+  - gaps in the data
+  - a holding that starts later than the others
+  - tickers that can't be calculated
+- **Safe for a public site:**
+  - limits per visitor and site-wide
+  - one download at a time
+  - error details never shown to visitors
 
 ## Run it yourself
 
@@ -128,40 +155,50 @@ git clone https://github.com/karakusethem09/signaldesk.git
 cd signaldesk
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt      # the app's packages plus pytest
 
-streamlit run app.py      # opens the dashboard in your browser
-pytest -q                 # 371 tests, all offline, about 5 seconds
+SIGNALDESK_MODE=local streamlit run app.py   # your own analysis, no request limits
+streamlit run app.py                         # same as the public site (limits on)
+pytest -q                                    # 1,319 tests, all offline, about 30 seconds
 ```
+
+To refresh the demo snapshot, run `python scripts/refresh_demo_data.py` and commit `data/demo/`.
 
 ## Project structure
 
 ```
 signaldesk/
-├── app.py                  # Streamlit dashboard (UI only, no math)
+├── app.py                  # Streamlit entry point
+├── ui/                     # the dashboard: layout, charts, formatting (no math, enforced by tests)
 ├── signaldesk/
-│   ├── data.py             # download, clean, cache prices; report gaps
-│   └── risk.py             # all the math; pure functions with warnings
-├── tests/                  # 371 offline tests: data 108 · risk 214 · app 49
+│   ├── data.py             # download, clean, cache prices; demo snapshot; report gaps
+│   ├── risk.py             # all the math; pure functions with warnings
+│   └── limits.py           # request limits for the public site
+├── data/demo/              # committed 5-year snapshot for the demo portfolio
+├── scripts/                # refresh_demo_data.py
+├── tests/                  # 1,319 offline tests
 ├── docs/
 │   ├── catch-log.md        # every mistake an agent caught, with evidence
 │   ├── decisions.md        # design decisions and why
 │   └── sessions/           # journal of each build session
+├── .github/workflows/      # CI: the test suite on every push
+├── .streamlit/config.toml  # public-site settings (no error details for visitors)
 ├── .claude/agents/         # the four agent role definitions
 └── CLAUDE.md               # project rules every agent follows
 ```
 
 ## Tests
 
-- **371 tests**, all offline: no internet needed, and they never touch the real price cache.
+- **1,319 tests**, all offline. They pass even with the network blocked at the socket and libcurl level,
+  and they never touch the real price cache. They run on every push via GitHub Actions.
 - **Math tests use hand-checkable examples.** For example, prices `[100, 110, 99]` must give
   returns `[0.10, −0.10]`, and the arithmetic is written in the test's comments.
-- **Dashboard tests read what the user actually sees.** They check the rendered text and the
-  chart data against `risk.py`.
-- **Planted-bug check:** the reviewer's planted bugs are caught by the suite:
-  - data: every planted bug in the final review
-  - math: 65 of 68 (the other 3 are harmless)
-  - dashboard: 16 of 16
+- **Dashboard tests read what the browser actually gets.** They check every table cell and every
+  chart's data against `risk.py`.
+- **A guard test scans every UI file and chart spec** and fails if any arithmetic sneaks into the
+  dashboard.
+- **Planted-bug check:** the reviewer's planted bugs are caught by the suite. In its last WP3 review,
+  58 of 59 were caught, and the survivor was fixed afterwards.
 
 ---
 
@@ -169,7 +206,13 @@ signaldesk/
 
 **Phase 1, the dashboard, is done.**
 
-**Phase 2 is the agents, built one at a time with the Anthropic SDK:**
+**Phase 1.5, the public website, is done.** It added the demo portfolio, limits, CI and a
+professional layout.
+
+**Phase 2 is the agents, built one at a time with the Anthropic SDK.** First comes a preparation step:
+`risk.py` will return its warnings as data rather than Python warnings. That fixes the one known
+multi-visitor issue ([C21](docs/catch-log.md#c21-a-visitors-warnings-can-get-lost-between-threads))
+and gives the agents structured diagnostics. Then:
 1. **Quant agent:** answers questions only by calling the Phase-1 functions. It never writes a number
    that didn't come from a tool call.
 2. **Macro agent:** inflation and interest rates (FRED).

@@ -39,6 +39,15 @@ Copy this template and give the entry the next number:
 | [C11](#c11-a-40-day-data-outage-was-called-a-holiday) | A 40-day data outage was called a holiday | risk-reviewer | quant-dev | suggestion |
 | [C12](#c12-gmes-real-squeeze-was-rejected-as-prices) | GME's real squeeze was rejected as "prices" | risk-reviewer | quant-dev | suggestion |
 | [C13](#c13-self-catch-the-csv-cache-changed-the-last-digit-of-prices) | Self-catch: the CSV cache changed the last digit of prices | data-engineer | data-engineer | – |
+| [C14](#c14-the-10-year-limit-refused-10y-every-day) | The 10-year limit refused "10Y" every day | risk-reviewer | data-engineer | blocking |
+| [C15](#c15-yahoos-rate-limits-never-reached-our-code) | Yahoo's rate limits never reached our code | risk-reviewer | data-engineer | blocking |
+| [C16](#c16-the-cache-clean-up-deleted-a-users-own-file) | The cache clean-up deleted a user's own file | risk-reviewer | data-engineer | blocking |
+| [C17](#c17-a-no-network-test-guard-that-could-not-see-the-network) | A "no network" test guard that could not see the network | risk-reviewer | data-engineer | warning |
+| [C18](#c18-a-late-starting-holding-silently-shortened-the-portfolio) | A late-starting holding silently shortened the portfolio ★ | risk-reviewer | quant-dev | suggestion |
+| [C19](#c19-reloading-the-page-reset-the-rate-limit) | Reloading the page reset the rate limit ★ | risk-reviewer | dashboard-dev | blocking |
+| [C20](#c20-the-no-math-guard-missed-24-of-26-tricks) | The no-math guard missed 24 of 26 tricks | risk-reviewer | dashboard-dev | suggestion |
+| [C21](#c21-a-visitors-warnings-can-get-lost-between-threads) | A visitor's warnings can get lost between threads (open) | risk-reviewer | dashboard-dev | warning |
+| [C22](#c22-tests-read--the-browser-drew-none) | Tests read "—", the browser drew "None" | risk-reviewer | dashboard-dev | suggestion |
 | [More](#smaller-catches) | 18 smaller catches | | | |
 
 ★ = highlighted in the README.
@@ -222,11 +231,148 @@ Copy this template and give the entry the next number:
 | R10 | Crypto (7 days a week) is annualized with a 252-day stock year | Documented: stocks/ETFs only |
 | R13 | The guard test couldn't tell a median from a mean | Stronger test |
 | A3 | A late-starting ticker silently had no line on the rolling chart | Caption explains why |
-| A4 | One extreme ticker made two charts vanish with developer-only advice | Plain-English message (deeper fix open) |
+| A4 | One extreme ticker made two charts vanish with developer-only advice | Plain-English message; fixed properly in Session 2 (`rolling_volatility`, `return_correlation`) |
 | A5 | Typing 4.0 for a 4% rate gave Sharpe −27 with no hint | Input limited, caption shows the rate used |
 | A6 | Long data gaps were shown as a soft info note | Shown as a warning |
 | A8 | Unrelated pandas/numpy warnings were swallowed | Passed on to the terminal |
 | A9 | "2708.1%" had no thousands separator | "2,708.1%" |
 
-**Logged for later (not fixed yet):** D6, D7, D12, R7, A7, A10–A14, and the deeper A4 fix.
+**Logged for later after Session 1:** D6, D7, D12, R7, A7, A10–A14, and the deeper A4 fix.
 Details are in the [session journal](sessions/2026-10-20-overnight-build.md#5-unfinished-items-and-things-im-unsure-about).
+**Status after Session 2:**
+- **Fixed:** D7 (unique temp files), D12 (`prune_cache`), and A4 (`rolling_volatility` and
+  `return_correlation`).
+- **Superseded:** A10 and A11, by the stricter guards in C20.
+- **Reduced but not fixed:** R7 (see C21).
+- **Still open:** D6 and A7.
+- **Not re-checked against the new UI:** A12–A14.
+
+---
+
+## Session 2: Phase 1.5, public website (2026-10-20 – 21)
+
+### C14: The 10-year limit refused "10Y" every day
+- **Session:** 2026-10-20 / Phase 1.5 · **Layer:** `signaldesk/limits.py` · **Caught by:** risk-reviewer · **Mistake by:** data-engineer `[W1]`
+- **What was wrong:** the public limit counted `days / 365.25 > 10`. A real 10-year range contains 2
+  or 3 leap days, so it came out as 10.0014 "years" and was refused. The refusal message then said
+  "Up to 10 years … (you asked for 10.00)".
+- **How it was found:** the reviewer looped over **every day from 2026 to 2033** and built the
+  window the way the app does (inclusive end + 1 day).
+- **Evidence:** refused on **2,922 of 2,922 days**, so a "10Y" button would never have worked.
+- **Fix:** the limit is now measured in calendar years from the last included day
+  (`earliest_allowed_start`), and the message names the earliest allowed start date.
+- **Guard:** a test loops over every end day from 2024 to 2033 for both ways of building the window.
+- **Lesson:** test a limit at every point where it is used, not just on one example.
+
+### C15: Yahoo's rate limits never reached our code
+- **Session:** 2026-10-20 / Phase 1.5 · **Layer:** `signaldesk/data.py` · **Caught by:** risk-reviewer · **Mistake by:** data-engineer `[W2, W3]`
+- **What was wrong:** the code had a branch for Yahoo's rate-limit error. But yfinance 1.7 catches
+  every error per ticker and turns it into "no data". So that branch never ran, and nine tests were
+  testing a path the real library never takes. A rate limit on one ticker told the visitor to "check
+  the ticker symbol". A weekend-only date range said "the provider may be down, or the symbol may not
+  exist", which were both false.
+- **How it was found:** the reviewer read yfinance's source code and then ran the **real**
+  `yf.download` offline with its internals patched to fail. A live run also lost MSFT to a
+  yfinance-internal "database is locked" error.
+- **Fix:** honest messages that name every possible cause (provider, symbol, dates), plus tests that
+  go through the real yfinance code.
+- **Lesson:** a mock that raises an error can test code the real library never reaches. Test through
+  the real dependency where possible.
+
+### C16: The cache clean-up deleted a user's own file
+- **Session:** 2026-10-20 / Phase 1.5 · **Layer:** `signaldesk/data.py` · **Caught by:** risk-reviewer · **Mistake by:** data-engineer `[W4]`
+- **What was wrong:** the new automatic cache clean-up deleted any old `prices_*.csv` in whatever
+  folder the caller passed.
+- **Evidence:** an 8-day-old user file `prices_my_q3_export.csv` was deleted by an ordinary
+  `load_prices` call.
+- **Fix:** the clean-up only touches names that exactly match the cache's own naming scheme
+  (checked against 60,000 fuzzed names), and it only runs automatically in the default cache folder.
+- **Lesson:** anything that deletes files needs a test with a lookalike file that must survive.
+
+### C17: A "no network" test guard that could not see the network
+- **Session:** 2026-10-20 / Phase 1.5 · **Layer:** `tests/test_data.py` · **Caught by:** risk-reviewer · **Mistake by:** data-engineer `[W5, W7]`
+- **What was wrong:** the guard that keeps tests offline only watched Python's sockets. yfinance makes
+  its requests through libcurl, which opens sockets in C.
+- **Evidence:** under the guard, an unpatched `yf.download` reached Yahoo (4 requests, 5 rows) while
+  the guard recorded **0 attempts**. A proxy setting could also route a "loopback-only" test off the
+  machine.
+- **Fix:** the guard now covers libcurl (blocking and async) and sets `NO_PROXY`, and self-tests
+  prove it trips. All 1,319 tests also pass with the network blocked at every level.
+- **Lesson:** test the test guard itself.
+
+### C18: A late-starting holding silently shortened the portfolio
+- **Session:** 2026-10-20 / Phase 1.5 · **Layer:** `signaldesk/risk.py` · **Caught by:** risk-reviewer · **Mistake by:** quant-dev `[Q1, Q6]`
+- **What was wrong:** the portfolio starts on the first date when every holding has a price. If one
+  holding starts late, the whole portfolio starts late, and nothing said so.
+- **Evidence:** with NVDA blank for its first 1,000 days, the portfolio covered 254 of 1,254 days,
+  with **zero warnings**. Next to SPY's full 5 years, the page would have shown 28.3% vs 12.7% over
+  **different periods**.
+- **Fix:**
+  - A warning names every holding that was missing on the dropped dates, with its first price date.
+    The first version could name a ticker that only had a one-day holiday and miss a second late
+    starter; the reviewer caught that too.
+  - The dashboard measures the benchmark over the portfolio's dates only and shows the start date.
+- **Lesson:** this is the sample-period trap the Phase-2 risk agent exists to catch, so the tools
+  must expose it instead of hiding it.
+
+### C19: Reloading the page reset the rate limit
+- **Session:** 2026-10-21 / Phase 1.5 · **Layer:** `ui/live.py` · **Caught by:** risk-reviewer · **Mistake by:** dashboard-dev `[U1]`
+- **What was wrong:** each visitor's budget of 10 live analyses an hour was tied to their browser
+  session. A page reload starts a new session with a fresh budget.
+- **Evidence:** in an automated test, a new session downloaded immediately after another had been
+  refused. A script could have pushed about **1,000 Yahoo downloads an hour** through the shared
+  server and had its IP blocked for every visitor.
+- **Fix:** a second, site-wide limit of 30 real downloads an hour. Cache hits are free, and a refused
+  or queued request uses neither budget.
+- **Guard:** the reviewer re-ran its attack: 35 new sessions → exactly 30 downloads, the 31st refused
+  with the site message. 40 threads arriving at once at 29/30 → exactly 1 download.
+- **Lesson:** a limit tied to something the visitor controls is not a limit.
+
+### C20: The no-math guard missed 24 of 26 tricks
+- **Session:** 2026-10-21 / Phase 1.5 · **Layer:** `tests/test_ui_guards.py` · **Caught by:** risk-reviewer · **Mistake by:** dashboard-dev `[U3, U4, U9, U10]`
+- **What was wrong:** the test enforcing "no math in the dashboard" only knew a short list of method
+  names.
+- **Evidence:** 24 of 26 sneaky snippets slipped through, including `a - b`, `x *= 100`, `.max()`,
+  `eval`, `operator.add`, a lambda, and an Altair `impute=0` that plots invented zeros. A planted
+  "Ahead of SPY by X%" caption computed in the UI passed all 206 UI tests.
+- **Fix:**
+  - The guard now flags every arithmetic operation on non-literal values, with exactly four pinned,
+    commented exceptions for layout and dates.
+  - It forbids lambdas, `max`/`min`, `eval`, `operator`, `functools`, pandas math aliases and dunder
+    tricks.
+  - It allow-lists chart encoding keys.
+  - Its self-test has 112 sneaky and 30 harmless snippets.
+- **Current code was clean:** the reviewer read every line of `ui/`.
+- **Lesson:** a rule is only as strong as its enforcement, and the enforcement needs adversarial tests.
+
+### C21: A visitor's warnings can get lost between threads
+- **Session:** 2026-10-21 / Phase 1.5 · **Layer:** `ui/analysis.py` · **Caught by:** risk-reviewer · **Mistake by:** dashboard-dev / original design `[U2, R7]`
+- **What is wrong:** the page collects `risk.py`'s warnings with Python's `warnings.catch_warnings`,
+  which is shared by the whole server process. A lock keeps two analyses apart, but pandas (about 370
+  times per page run) and Streamlit itself use the same mechanism outside the lock.
+- **Evidence:** in a deterministic race, a visitor's page lost **all** its warning texts. Under
+  aggressive thread switching, 10.6% of analyses did. At normal settings it happened 0 times in 703.
+- **Impact:** the **numbers are never affected**, and the ⚠ short-sample flag, skipped-row notes and
+  start-date caption still show, because they come from data.
+- **Status: reduced, not fixed.** The code's comments say so honestly. The real fix is for `risk.py`
+  to return its diagnostics as data. The Phase-2 risk agent needs exactly that, so it is the first
+  Phase-2 preparation task.
+- **Lesson:** process-wide state and many simultaneous users don't mix. Prefer returning information
+  as data over side channels.
+
+### C22: Tests read "—", the browser drew "None"
+- **Session:** 2026-10-21 / Phase 1.5 · **Layer:** `ui/formatting.py` · **Caught by:** risk-reviewer · **Mistake by:** dashboard-dev `[U8]`
+- **What was wrong:** empty table cells were formatted as "—" through pandas' Styler. Streamlit's
+  browser ignores that for empty cells and draws its own "None". The tests read the Styler's text,
+  so they passed while visitors saw "None". The Note column was also cut off.
+- **How it was found:** the reviewer opened the page in headless Chrome and compared it with what the
+  tests read.
+- **First fix, and the bug it caused:** every cell was sent as finished text. That fixed "None", but
+  the next review found that clicking a column header now sorted alphabetically, so 5.1% ranked above
+  29.3% `[U14]`.
+- **Final fix:** tables send real numbers and dates with Streamlit's own `placeholder="—"` for empty
+  cells. Tests check the data Streamlit actually sends (numeric types, the placeholder, and the
+  displayed text of every cell) in 6 awkward-data scenarios. A browser check confirmed "—" everywhere
+  and sorting by value.
+- **Lesson:** a test of the display has to look at what the user's screen gets, not an intermediate
+  object. And once again, a fix needed its own review.
