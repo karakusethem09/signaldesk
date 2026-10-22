@@ -48,7 +48,14 @@ def main() -> None:
             )
         )
         return
-    sections.render_page(dataset, controls)
+    try:
+        sections.render_page(dataset, controls)
+    except Exception:  # whatever else goes wrong while drawing: say so, offer a way back, keep the footer
+        log.exception("Unexpected error while drawing the page")
+        st.error("Something unexpected went wrong while drawing this page. Please reload it, or try again in a moment.")
+        if state.in_custom_mode():
+            sections.offer_demo()
+        sections.render_footer()
 
 
 # Streamlit runs this file as "__main__"; a plain `import app` does not, so importing is harmless.

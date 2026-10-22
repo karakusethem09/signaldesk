@@ -14,6 +14,7 @@ from signaldesk import risk
 from ui.analysis import CONFIDENCE, skipped_rows
 
 NO_VALUE = "—"  # shown for a number that does not exist (for example a skipped ticker)
+PLACEHOLDER = NO_VALUE  # what st.dataframe draws for an empty cell (otherwise the browser writes "None")
 
 
 def format_percent(value: float) -> str:
@@ -87,38 +88,64 @@ def metrics_for_display(summary: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-def style_metrics(table: pd.DataFrame) -> pd.io.formats.style.Styler:
-    """Format the numbers as text and grey out the rows that carry a note."""
-    percent_columns = [
+def percent_columns(table: pd.DataFrame) -> list[str]:
+    """The metric columns that are shown as percents (everything but Sharpe, the count and the note)."""
+    return [
         name
         for name in table.columns
         if name in ("Annualized return", "Annualized volatility")
         or name.startswith(("Max drawdown", "1-day VaR"))
     ]
 
+
+def style_metrics(table: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """The metrics table: the NUMBERS stay numbers, a Styler formats how they are shown.
+
+    Why numbers and not text: a column of real numbers sorts by value when a visitor clicks its header
+    (a column of texts sorts alphabetically, which puts "5.1%" above "29.3%"). An empty cell stays empty
+    in the data, and ``PLACEHOLDER`` (passed to ``st.dataframe``) makes the browser draw a dash for it,
+    instead of its own "None". Rows that carry a note are greyed out.
+    """
+
     def grey_out(row: pd.Series) -> list[str]:
         return ["color: gray" if row["Note"] else ""] * len(row)
 
     return (
-        table.style.format(format_percent, subset=percent_columns)
-        .format("{:.2f}", subset=["Sharpe ratio"], na_rep=NO_VALUE)
-        .format("{:,d}", subset=["Daily returns (n)"])
+        table.style.format(format_percent, subset=percent_columns(table))
+        .format(format_ratio, subset=["Sharpe ratio"])
+        .format(format_count, subset=["Daily returns (n)"])
         .apply(grey_out, axis=1)
     )
 
 
+def format_count(value: float) -> str:
+    """A whole number with a thousands separator ("1,253"), or a dash when there is none."""
+    if pd.isna(value):
+        return NO_VALUE
+    return f"{int(value):,}"
+
+
+def format_date(value) -> str:
+    """A date as 2026-01-31, or a dash when there is no date (NaT)."""
+    if pd.isna(value):
+        return NO_VALUE
+    return f"{value:%Y-%m-%d}"
+
+
 def style_weights(weights: dict[str, float]) -> pd.io.formats.style.Styler:
-    """The holdings and their starting weights as a table of percentages (formatting only)."""
+    """The holdings and their starting weights: numbers, shown as percentages (formatting only)."""
     table = pd.DataFrame({"Starting weight": list(weights.values())}, index=pd.Index(list(weights), name="Ticker"))
     return table.style.format(format_percent)
 
 
 def style_gaps(gaps: pd.DataFrame) -> pd.io.formats.style.Styler:
-    """``data.find_gaps`` for people: readable column names, plain dates, and a dash where there is no date."""
+    """``data.find_gaps`` for people: readable column names, counts and real dates (they sort by value).
+
+    A day with no date stays empty (NaT) in the data and is drawn as a dash through ``PLACEHOLDER``.
+    """
     table = gaps.rename(
         columns={"missing_count": "Missing prices", "first_missing": "First missing", "last_missing": "Last missing"}
     )
-    return (
-        table.style.format("{:,d}", subset=["Missing prices"])
-        .format("{:%Y-%m-%d}", subset=["First missing", "Last missing"], na_rep=NO_VALUE)
+    return table.style.format(format_count, subset=["Missing prices"]).format(
+        format_date, subset=["First missing", "Last missing"]
     )

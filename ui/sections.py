@@ -24,7 +24,7 @@ from ui import inputs
 from ui.analysis import CONFIDENCE, LONG_GAP_PHRASE, PORTFOLIO, PORTFOLIO_MESSAGE_PREFIX, Analysis, analyze
 from ui.charts import correlation_chart, line_chart, series_colors, to_long
 from ui.formatting import (
-    NO_VALUE,
+    PLACEHOLDER,
     format_percent,
     format_ratio,
     metrics_for_display,
@@ -73,6 +73,16 @@ def render_unavailable(problem: Unavailable) -> None:
     if problem.offer_demo:
         offer_demo()
     render_footer()
+
+
+def show_table(table, **options) -> None:
+    """Draw a table. EVERY table goes through here, so none can forget the placeholder.
+
+    ``placeholder`` is the text the browser draws for an empty cell. Without it Streamlit writes "None"
+    (and ignores the dash a Styler chose for that cell). The cells themselves stay real numbers or dates,
+    so clicking a column header sorts by value.
+    """
+    st.dataframe(table, placeholder=PLACEHOLDER, **options)
 
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +226,7 @@ def render_overview(dataset: Dataset, analysis: Analysis, controls: Controls) ->
         )
 
     st.subheader("Holdings and starting weights")
-    st.dataframe(style_weights(dataset.weights), width="content")
+    show_table(style_weights(dataset.weights), width="content")
     st.caption(
         f"Benchmark: {analysis.benchmark}. The weights apply on the first day only. "
         "A winner grows into a bigger share of the portfolio, because nothing is ever sold or bought again."
@@ -316,31 +326,36 @@ def render_metrics(analysis: Analysis) -> None:
     """The table of headline risk numbers: one row per holding, then the portfolio and the benchmark."""
     st.subheader("Key metrics")
     table = metrics_for_display(analysis.summary)
-    st.dataframe(
+    right = "right"  # numbers read better right-aligned
+    show_table(
         style_metrics(table),
         width="stretch",
         column_config={
             "Annualized return": st.column_config.Column(
-                help="Steady yearly growth rate (geometric, a year = 252 trading days)."
+                help="Steady yearly growth rate (geometric, a year = 252 trading days).", alignment=right
             ),
             "Annualized volatility": st.column_config.Column(
-                help="How much daily returns jump around, scaled to one year."
+                help="How much daily returns jump around, scaled to one year.", alignment=right
             ),
             "Sharpe ratio": st.column_config.Column(
-                help="Return above the risk-free rate per unit of volatility."
+                help="Return above the risk-free rate per unit of volatility.", alignment=right
             ),
             "Max drawdown (loss)": st.column_config.Column(
-                help="Biggest fall from an earlier peak. A loss, shown as a positive number."
+                help="Biggest fall from an earlier peak. A loss, shown as a positive number.", alignment=right
             ),
             next(c for c in table.columns if c.startswith("1-day VaR")): st.column_config.Column(
                 help=(
                     "Historical Value at Risk: a one-day loss that was not exceeded on "
                     f"{CONFIDENCE:.0%} of past days. A loss, shown as a positive number. "
                     "Negative means there was no loss at this level."
-                )
+                ),
+                alignment=right,
             ),
             "Daily returns (n)": st.column_config.Column(
-                help="How many daily returns the numbers are based on."
+                help="How many daily returns the numbers are based on.", alignment=right
+            ),
+            "Note": st.column_config.TextColumn(
+                width="large", help="Why a row's numbers should be read with care (a short sample, or a skipped ticker)."
             ),
         },
     )
@@ -373,7 +388,7 @@ def render_data(dataset: Dataset) -> None:
     )
 
     st.markdown("**Missing prices per ticker** (empty cells, not whole missing days)")
-    st.dataframe(style_gaps(data.find_gaps(prices)), width="stretch")
+    show_table(style_gaps(data.find_gaps(prices)), width="stretch")
 
     st.markdown("**Possible gaps (most are exchange holidays)**: weekdays with no row at all")
     try:
@@ -385,7 +400,7 @@ def render_data(dataset: Dataset) -> None:
         if len(missing) == 0:
             st.write("None.")
         else:
-            st.dataframe(
+            show_table(
                 pd.DataFrame({"Date": missing.strftime("%Y-%m-%d"), "Weekday": missing.strftime("%A")}),
                 hide_index=True,
                 width="stretch",
@@ -448,6 +463,15 @@ def render_about() -> None:
 # The whole page
 # --------------------------------------------------------------------------- #
 
+def draw_safely(what: str, function, *args) -> None:
+    """Draw one part of the page. If it fails, log it and say so in its place; the rest of the page goes on."""
+    try:
+        function(*args)
+    except Exception:  # a bug while drawing must not take the other parts (or the footer) down with it
+        log.exception("Unexpected error while drawing the %s", what)
+        st.error(f"Something unexpected went wrong while drawing the {what}. The rest of the page is not affected.")
+
+
 def render_page(dataset: Dataset, controls: Controls) -> None:
     """Analyse the data set once, then draw the page top to bottom."""
     render_title(dataset.as_of_text)
@@ -469,20 +493,22 @@ def render_page(dataset: Dataset, controls: Controls) -> None:
         render_footer()
         return
 
-    render_kpis(analysis, controls.risk_free_rate)
-    render_warnings(analysis.warnings)
+    # Each part is drawn on its own: a bug in one table or chart is reported in its own place, and the
+    # other tabs, the key numbers and the footer are still there.
+    draw_safely("key numbers", render_kpis, analysis, controls.risk_free_rate)
+    draw_safely("warnings", render_warnings, analysis.warnings)
 
     overview, risk_tab, correlation, holdings, data_tab, about = st.tabs(TAB_NAMES)
     with overview:
-        render_overview(dataset, analysis, controls)
+        draw_safely("overview", render_overview, dataset, analysis, controls)
     with risk_tab:
-        render_risk(analysis, controls)
+        draw_safely("risk charts", render_risk, analysis, controls)
     with correlation:
-        render_correlation(analysis)
+        draw_safely("correlation chart", render_correlation, analysis)
     with holdings:
-        render_metrics(analysis)
+        draw_safely("metrics table", render_metrics, analysis)
     with data_tab:
-        render_data(dataset)
+        draw_safely("data tab", render_data, dataset)
     with about:
-        render_about()
+        draw_safely("about tab", render_about)
     render_footer()

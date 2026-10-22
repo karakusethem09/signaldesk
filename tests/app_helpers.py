@@ -189,13 +189,46 @@ def captions(block) -> list[str]:
 
 
 def metrics_table(at: AppTest) -> pd.DataFrame:
-    """The Holdings tab's table (the raw numbers behind it)."""
+    """The Holdings tab's table EXACTLY AS STREAMLIT SENDS IT to the browser: real numbers, NaN where empty.
+
+    Use ``shown_table`` for the text a visitor reads, and ``assert_sortable_table`` for what the browser does with it.
+    """
     return tab(at, "Holdings").dataframe[0].value
 
 
 def shown_table(at: AppTest) -> pd.DataFrame:
     """The Holdings tab's table as the USER SEES it: the formatted text of every cell ("25.6%")."""
     return display_values(tab(at, "Holdings").dataframe[0])
+
+
+def assert_sortable_table(element, text_columns=()) -> None:
+    """A table is sent so that clicking a header SORTS BY VALUE, and an empty cell is drawn as a dash.
+
+    - ``placeholder`` is "—": without it the browser draws its own "None" for an empty cell, whatever text a
+      Styler chose for it (AppTest reads the Styler's text, so a test of that text alone would pass anyway).
+    - Every column except ``text_columns`` is numeric or a date: a column of strings would sort alphabetically
+      ("5.1%" above "29.3%", "-17.4%" above "-17.1%").
+    - The Styler's text for an empty cell is the dash, and for any other cell never "None", "nan" or "NaT".
+    """
+    assert element.proto.placeholder == "—", repr(element.proto.placeholder)
+    sent = element.value
+    for column in sent.columns:
+        if column in text_columns:
+            assert pd.api.types.is_string_dtype(sent[column]) or sent[column].dtype == object, column
+        else:
+            kind = sent[column].dtype
+            assert pd.api.types.is_numeric_dtype(kind) or pd.api.types.is_datetime64_any_dtype(kind), (
+                f"column {column!r} is sent as {kind}: it would sort as text"
+            )
+    if element.proto.arrow_data.styler.display_values:
+        shown = display_values(element)  # a Styler chose the text
+    else:  # a plain table: the browser draws the data itself, and the placeholder for an empty cell
+        shown = sent.astype(object).where(sent.notna(), "—").astype(str)
+    assert list(sent.columns) == list(shown.columns) and list(sent.index.astype(str)) == list(shown.index.astype(str))
+    empty = sent.isna().to_numpy()
+    shown_values = shown.to_numpy()
+    assert (shown_values[empty] == "—").all(), "an empty cell must show the dash"
+    assert not pd.Series(shown_values[~empty].ravel()).isin(["None", "nan", "NaN", "NaT", "<NA>"]).any()
 
 
 def display_values(element) -> pd.DataFrame:

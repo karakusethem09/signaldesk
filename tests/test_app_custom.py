@@ -47,7 +47,7 @@ from app_helpers import (
 )
 
 from signaldesk import data, limits, risk
-from ui import inputs, live, state
+from ui import inputs, live, sections, state
 
 pytestmark = [
     pytest.mark.usefixtures("app_env"),
@@ -566,6 +566,27 @@ def test_prices_that_load_but_cannot_be_analysed_show_an_error_and_a_way_back(mo
     assert at.sidebar.radio(key="mode").value == MODE_DEMO and len(at.metric) == 5
 
 
+def test_a_drawing_bug_after_a_good_run_keeps_the_footer_and_offers_the_way_back(monkeypatch, caplog):
+    install_loader(monkeypatch)
+    at = run_custom()
+    assert len(at.metric) == 5
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the page code blew up")
+
+    monkeypatch.setattr(sections, "render_page", broken)
+    with caplog.at_level("ERROR"):
+        at.run()
+
+    assert not at.exception
+    assert texts(at.error) == [
+        "Something unexpected went wrong while drawing this page. Please reload it, or try again in a moment."
+    ]
+    assert [b.label for b in at.button if b.label == "Back to the demo"]
+    assert FOOTER in captions(at)
+    assert any("blew up" in str(r.exc_info[1]) for r in caplog.records if r.exc_info)
+
+
 def test_the_data_tab_says_whether_the_prices_were_downloaded_or_reused(monkeypatch):
     install_loader(monkeypatch)
     first = run_custom()
@@ -727,6 +748,33 @@ def test_a_request_somebody_else_already_loaded_is_still_served_when_the_site_is
     again = run_custom(**other_dates(1))  # the same request as visitor 1: from the shared memory, free
     assert not again.warning and len(again.metric) == 5
     assert len(loader.calls) == 2
+
+
+def test_a_busy_server_does_not_hide_the_site_limit_message(monkeypatch, site_cap_of_two):
+    install_loader(monkeypatch)
+    monkeypatch.setattr(live, "GATE_TIMEOUT_SECONDS", 0.05)
+    run_custom(**other_dates(1))
+    run_custom(**other_dates(2))  # the site's two loads are spent
+    gate = state.shared_download_gate(limits.PUBLIC_LIMITS.max_concurrent_downloads)
+    with gate.slot(timeout=1):  # another download is running right now
+        third = run_custom(**other_dates(3))
+
+    assert len(third.warning) == 1
+    assert third.warning[0].value.startswith("The site has reached its hourly limit of live analyses.")
+    assert limits.BUSY_MESSAGE not in texts(third.warning)  # the limit, not "busy"
+
+
+def test_a_busy_server_does_not_hide_the_personal_limit_message(monkeypatch):
+    monkeypatch.setattr(limits, "PUBLIC_LIMITS", limits.RequestLimits(10, 10, 1, 1, 30))
+    install_loader(monkeypatch)
+    monkeypatch.setattr(live, "GATE_TIMEOUT_SECONDS", 0.05)
+    at = run_custom(**other_dates(1))
+    gate = state.shared_download_gate(1)
+    with gate.slot(timeout=1):
+        at = run_custom(**other_dates(2), at=at)
+
+    assert len(at.warning) == 1 and at.warning[0].value.startswith("You have used your 1 live analyses")
+    assert limits.BUSY_MESSAGE not in texts(at.warning)
 
 
 def test_the_personal_limit_message_is_not_the_site_message(monkeypatch):

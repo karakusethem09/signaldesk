@@ -36,13 +36,24 @@ FORBIDDEN_METHODS = {
     "rdiv", "rtruediv", "rfloordiv", "rmod", "rpow", "mod", "neg", "nlargest", "nsmallest", "describe",
     "idxmax", "idxmin", "argmax", "argmin", "skew", "kurt", "sem", "corrwith", "accumulate", "reduce",
     "fsum", "hypot",
-    # inventing data: the UI never fills a gap or invents a value
-    "fillna", "ffill", "bfill", "interpolate",
-}  # (.apply is allowed: the Styler uses it to set CSS colours, not to calculate; a lambda is not)
-FORBIDDEN_NAMES = {  # built-in functions that calculate, or that run text as code
-    "sum", "pow", "abs", "divmod", "max", "min", "round", "eval", "exec", "compile", "__import__", "reduce",
-    "globals", "locals", "vars",
+    # the long names of the operators, matrix products, and ways to run a function over the data
+    "multiply", "subtract", "divide", "product", "dot", "where", "mask", "pipe", "transform", "applymap",
+    # more statistics
+    "autocorr",
+    # inventing data: the UI never fills a gap or invents a value. reindex(method=...) and asfreq(method=...)
+    # fill gaps, so the method names themselves are forbidden.
+    "fillna", "ffill", "bfill", "interpolate", "reindex", "reindex_like", "asfreq",
 }
+# Forbidden only when CALLED: ``frame.mode()`` is a statistic, but ``dataset.mode`` is our own plain field.
+FORBIDDEN_METHOD_CALLS = {"mode"}  # (.apply is allowed: the Styler uses it to set CSS colours, not to calculate; a lambda is not)
+FORBIDDEN_NAMES = {  # built-in functions that calculate, or that run text as code, or reach around the rules
+    "sum", "pow", "abs", "divmod", "max", "min", "round", "eval", "exec", "compile", "__import__", "reduce",
+    "globals", "locals", "vars", "__builtins__",
+}
+# Methods that run a function over the data. Given a function NAME as text ("cumprod"), they calculate.
+RUNNERS = {"apply", "map", "pipe", "agg", "aggregate", "transform", "applymap"}
+# "module.attribute" pairs that reach the internals: sys.modules['numpy'], pd.core.algorithms ...
+FORBIDDEN_MODULE_ATTRIBUTES = {("sys", "modules"), ("pd", "core"), ("pandas", "core"), ("np", "core"), ("numpy", "core")}
 FORBIDDEN_IMPORTS = {
     "numpy", "math", "statistics", "scipy", "cmath", "decimal", "fractions",  # math libraries
     "operator", "functools", "importlib", "builtins",  # ways to do arithmetic or imports without writing them
@@ -60,6 +71,17 @@ ALLOWED_EXPRESSION_TEXT = "abs(datum.Correlation) > 0.6"
 NOT_MATH_MARKER = re.compile(r"#\s*not math:\s*(layout|date)\b")
 
 TEXT_METHODS = {"join", "format", "strftime", "upper", "lower", "strip", "title", "removeprefix", "removesuffix", "replace"}
+
+
+def _holds_function_names(node) -> bool:
+    """A text, or a list / tuple / set / dict VALUES holding text: function names such as 'cumprod' or ['std', 'mean']."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_holds_function_names(element) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(_holds_function_names(value) for value in node.values if value is not None)
+    return False
 
 
 def _is_number(node) -> bool:
@@ -88,7 +110,12 @@ def _texty(node) -> bool:
     if isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr", "format", "list", "tuple"}:
             return True
-        if isinstance(node.func, ast.Attribute) and node.func.attr in TEXT_METHODS:
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in TEXT_METHODS
+            and isinstance(node.func.value, (ast.Constant, ast.JoinedStr))  # ", ".join(...), not df.replace(...)
+            and (not isinstance(node.func.value, ast.Constant) or isinstance(node.func.value.value, (str, bytes)))
+        ):
             return True
     return False
 
@@ -118,7 +145,8 @@ def find_math(source: str) -> list[str]:
     marked = marked_lines(source)
 
     def excused(node) -> bool:
-        return any(number in marked for number in range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1))
+        """Only an expression that sits on ONE marked line is excused (not one that spans several lines)."""
+        return node.lineno == getattr(node, "end_lineno", node.lineno) and node.lineno in marked
 
     found = []
     for node in ast.walk(tree):
@@ -133,6 +161,13 @@ def find_math(source: str) -> list[str]:
                 found.append(f"line {node.lineno}: .today (use data.market_today())")
             if node.attr in {"now", "utcnow"}:
                 found.append(f"line {node.lineno}: .{node.attr} (use data.market_today())")
+            calls_super = (
+                isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "super"
+            )
+            if node.attr.startswith("__") and node.attr.endswith("__") and not (node.attr == "__init__" and calls_super):
+                found.append(f"line {node.lineno}: .{node.attr} (a dunder method is arithmetic by another name)")
+            if isinstance(node.value, ast.Name) and (node.value.id, node.attr) in FORBIDDEN_MODULE_ATTRIBUTES:
+                found.append(f"line {node.lineno}: {node.value.id}.{node.attr} (reaches into library internals)")
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in FORBIDDEN_NAMES:
             found.append(f"line {node.lineno}: {node.id}(...)")
         if isinstance(node, ast.Lambda):
@@ -149,6 +184,15 @@ def find_math(source: str) -> list[str]:
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
             if not (_literal_only(node) or excused(node)):
                 found.append(f"line {node.lineno}: unary sign change")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in FORBIDDEN_METHOD_CALLS:
+                found.append(f"line {node.lineno}: .{node.func.attr}() (a statistic)")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in RUNNERS:
+            named = list(node.args[:1]) + [kw.value for kw in node.keywords if kw.arg in {"func", "f"}]
+            if any(_holds_function_names(arg) for arg in named):
+                found.append(
+                    f"line {node.lineno}: .{node.func.attr}(...) runs functions by their NAMES as text ('std', ['sum'], ...)"
+                )
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"getattr", "setattr", "delattr"}:
             name = node.args[1] if len(node.args) > 1 else None
             if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
@@ -170,6 +214,8 @@ def find_math(source: str) -> list[str]:
             for alias in node.names:
                 if alias.name in FORBIDDEN_METHODS or alias.name in FORBIDDEN_NAMES:
                     found.append(f"line {node.lineno}: from ... import {alias.name} (a calculating function)")
+                if (node.module, alias.name) in {("sys", "modules"), ("pandas", "core"), ("numpy", "core")}:
+                    found.append(f"line {node.lineno}: from {node.module} import {alias.name} (library internals)")
     return found
 
 
@@ -287,7 +333,66 @@ SNEAKY_SNIPPETS = {
     "aggregate shorthand": "d = alt.Y('mean(Value):Q')",
     "aggregate keyword": "e = alt.Y(field='v', aggregate='mean')",
     "a Vega expression": "c = alt.condition('datum.Value > 1', alt.value('red'), alt.value('blue'))",
+    # the long names of the operators and other ways to calculate
+    ".multiply(100)": "y = df.multiply(100)",
+    ".subtract": "y = df.subtract(b)",
+    ".divide": "y = df.divide(b)",
+    ".dot(w)": "y = df.dot(w)",
+    ".where": "y = df.where(df > 0)",
+    ".mask": "y = df.mask(df > 0)",
+    ".pipe": "y = df.pipe(scale)",
+    ".transform": "y = df.transform(scale)",
+    ".applymap": "y = df.applymap(scale)",
+    # dunder methods are the operators by another name
+    "a.__mul__(b)": "y = a.__mul__(b)",
+    "a.__neg__()": "y = a.__neg__()",
+    "a.__add__(b)": "y = a.__add__(b)",
+    "a.__truediv__(b)": "y = a.__truediv__(b)",
+    "__getattribute__": "y = df.__getattribute__('std')()",
+    # a function handed over by NAME, as text
+    ".apply('cumprod')": "y = df.apply('cumprod')",
+    ".map('sqrt')": "y = df.map('sqrt')",
+    ".pipe('abs')": "y = df.pipe('abs')",
+    ".apply(func='cumsum')": "y = df.apply(func='cumsum')",
+    ".transform('cumsum')": "y = df.transform('cumsum')",
+    ".agg(func='std')": "y = df.agg(func='std')",
+    ".apply(['cumprod'])": "y = df.apply(['cumprod'])",
+    ".agg(['std', 'mean'])": "y = df.agg(['std', 'mean'])",
+    ".agg(('std',))": "y = df.agg(('std',))",
+    ".agg({'a': 'std'})": "y = df.agg({'a': 'std'})",
+    ".agg({'a': ['std']})": "y = df.agg({'a': ['std']})",
+    ".apply(func=['sum'])": "y = df.apply(func=['sum'])",
+    ".transform(['cumsum'])": "y = df.transform(['cumsum'])",
+    # more statistics, and methods that fill gaps
+    ".autocorr()": "y = s.autocorr()",
+    ".mode()": "y = df.mode()",
+    ".reindex(method='ffill')": "y = df.reindex(idx, method='ffill')",
+    ".reindex(idx)": "y = df.reindex(idx)",
+    ".asfreq('D', method='ffill')": "y = df.asfreq('D', method='ffill')",
+    ".asfreq('D')": "y = df.asfreq('D')",
+    ".reindex_like": "y = df.reindex_like(other)",
+    # a method call is "text" only on a text LITERAL
+    "df.replace(0, 0) * 100": "y = df.replace(0, 0) * 100",
+    "s.title() * 100": "y = s.title() * 100",
+    "s.strip() + 5": "y = s.strip() + 5",
+    "df.join(other) * 2": "y = df.join(other) * 2",
+    "x.format(y) - 1": "y = x.format(y) - 1",
+    # reaching around the rules
+    "sys.modules": "import sys\nnp = sys.modules['numpy']",
+    "from sys import modules": "from sys import modules",
+    "__builtins__": "f = __builtins__['eval']",
+    "pd.core": "y = pd.core.algorithms.unique(x)",
+    "np.core": "y = np.core.numeric.x",
+    # a marker must sit on the very line (and the whole expression on that one line)
+    "an expression over two lines with the marker on the first": "x = (a -  # not math: date\n     b)",
+    "an expression over two lines with the marker on the last": "x = (a -\n     b)  # not math: date",
 }
+# Every method on the list the reviewer handed over, called plainly.
+for _name in (
+    "cumprod cumsum cummax cummin pct_change diff rolling expanding ewm resample corr cov std var mean median "
+    "quantile sum prod product multiply subtract divide truediv floordiv"
+).split():
+    SNEAKY_SNIPPETS[f".{_name}()"] = f"y = df.{_name}()"
 
 # Ordinary code the scan must leave alone.
 HARMLESS_SNIPPETS = {
@@ -315,6 +420,15 @@ HARMLESS_SNIPPETS = {
     "comparisons": "ok = a < b <= c\nsame = a == b",
     "the one allowed chart expression": "c = alt.condition('abs(datum.Correlation) > 0.6', alt.value('white'), alt.value('black'))",
     "a Timedelta rounded up by pandas": "w = pd.Timedelta(seconds=s).ceil('min')",
+    "joining text": "t = ', '.join(names) + '!'",
+    "formatting a text literal": "t = '{} items'.format(n)",
+    "a method on a text literal": "t = '%s'.upper() + name",
+    "Styler.apply with a named function": "styled = table.style.apply(grey_out, axis=1)",
+    "apply with a named function (not text)": "y = df.apply(my_function)",
+    "a plain field called mode": "ok = dataset.mode == 'custom'",
+    "a method called mode_of_run on our own object": "x = obj.mode_name()",
+    "super().__init__": "class E(Exception):\n    def __init__(self, m):\n        super().__init__(m)",
+    "a marked line inside a longer statement": "x = foo(\n    a - b,  # not math: date\n    c,\n)",
 }
 
 
@@ -357,17 +471,43 @@ def test_the_two_planted_bugs_the_reviewer_slipped_past_the_old_guard_are_caught
     assert find_math(percent) == ["line 2: augmented assignment (Mult)"]
 
 
-def test_the_real_ui_excuses_only_a_few_known_lines():
-    """Adding a new "# not math" line is a decision to review, so it needs a change in this test."""
-    excused = {}
+# The ONLY lines of the UI that may carry a "# not math" marker, written out in full. Adding math to one of
+# them, or adding a new marked line, changes this text and fails the test below: a reviewed decision.
+EXCUSED_LINES = {
+    "charts.py": ["height = 64 * len(tickers)  # not math: layout (a taller chart for more tickers)"],
+    "inputs.py": ["return end + timedelta(days=1)  # not math: date"],
+    "live.py": [
+        "if self._clock() - stored_at >= self._ttl:  # not math: date (how old an entry is, in seconds)",
+        "for old_key in [k for k, (stored_at, _) in self._items.items() if now - stored_at >= self._ttl]:  # not math: date",
+    ],
+}
+
+
+def excused_line_texts(source: str) -> list[str]:
+    """The full text (code and comment) of every line that carries a "# not math: layout|date" marker."""
+    lines = source.splitlines()
+    return [lines[number - 1].strip() for number in sorted(marked_lines(source))]
+
+
+def test_the_real_ui_excuses_only_these_exact_lines():
     for path in UI_FILES:
-        for reason in marked_lines(path.read_text()).values():
-            excused[(path.name, reason)] = excused.get((path.name, reason), 0) + 1
-    assert excused == {
-        ("charts.py", "layout"): 1,  # the heatmap's height per ticker
-        ("inputs.py", "date"): 1,  # the picker's end date is included: load_prices wants the day after
-        ("live.py", "date"): 2,  # how old a memory entry is, in seconds
-    }
+        assert excused_line_texts(path.read_text()) == EXCUSED_LINES.get(path.name, []), path.name
+
+
+def test_adding_math_to_an_excused_line_fails_the_exact_line_pin():
+    """The marker excuses a whole line, so what is ON the line must be pinned, not just how many lines are marked."""
+    source = (UI_DIR / "charts.py").read_text()
+    sneaky = source.replace("64 * len(tickers)  # not math: layout", "64 * len(tickers) * 100  # not math: layout")
+    assert sneaky != source
+    assert find_math(sneaky) == []  # the scan alone lets it through: the line is excused ...
+    assert excused_line_texts(sneaky) != EXCUSED_LINES["charts.py"]  # ... and the pin is what catches it
+    # A second calculation tucked into another excused line is caught the same way.
+    live_source = (UI_DIR / "live.py").read_text()
+    sneaky = live_source.replace("if self._clock() - stored_at >= self._ttl:", "if (self._clock() - stored_at) / 100 >= self._ttl:")
+    assert sneaky != live_source and excused_line_texts(sneaky) != EXCUSED_LINES["live.py"]
+    # And so is a brand-new marked line.
+    extra = source + "\nBAD = a - b  # not math: date\n"
+    assert find_math(extra) == [] and excused_line_texts(extra) != EXCUSED_LINES["charts.py"]
 
 
 def charts_made_in(path) -> set[str]:

@@ -25,6 +25,7 @@ from app_helpers import (
     MODE_CUSTOM,
     MODE_DEMO,
     ROOT,
+    assert_sortable_table,
     assert_chart_shows,
     assert_no_chart_math,
     captions,
@@ -210,6 +211,7 @@ def test_the_key_numbers_use_the_chosen_risk_free_rate(monkeypatch):
     # ... and the holdings table's Sharpe column follows too.
     full = expected_summary(demo.prices, rf=0.04)
     assert metrics_table(at)["Sharpe ratio"].tolist() == full["sharpe_ratio"].tolist()
+    assert shown_table(at)["Sharpe ratio"].tolist() == [f"{value:.2f}" for value in full["sharpe_ratio"]]
 
 
 def test_risk_free_rate_has_sensible_bounds_and_the_page_says_which_rate_it_used(monkeypatch):
@@ -259,7 +261,7 @@ def test_metrics_table_has_a_row_per_holding_then_portfolio_and_benchmark(monkey
         "Note",
     ]
     assert (table["Daily returns (n)"] == 299).all()  # 300 prices -> 299 returns
-    assert not table.drop(columns="Note").isna().any().any()
+    assert not table.drop(columns="Note").isna().any().any()  # nothing empty
     assert (table["Note"] == "").all()
 
 
@@ -326,12 +328,17 @@ def test_hand_checked_numbers_appear_exactly_as_expected(monkeypatch):
 
 def test_table_numbers_come_straight_from_risk_summary(monkeypatch):
     demo = install_demo(monkeypatch, make_demo())
-    table = metrics_table(run_app())
+    at = run_app()
+    table = metrics_table(at)  # what is sent to the browser: the REAL numbers (so the columns sort by value)
     expected = expected_summary(demo.prices)
 
     assert table["Annualized return"].tolist() == expected["annualized_return"].tolist()
+    assert table["Annualized volatility"].tolist() == expected["annualized_volatility"].tolist()
     assert table["1-day VaR 95% (loss)"].tolist() == expected["var_95"].tolist()
     assert table["Max drawdown (loss)"].tolist() == expected["max_drawdown"].tolist()
+    assert table["Sharpe ratio"].tolist() == expected["sharpe_ratio"].tolist()
+    assert table["Daily returns (n)"].tolist() == expected["n_obs"].tolist()
+    assert_sortable_table(tab(at, "Holdings").dataframe[0], text_columns=["Note"])
 
 
 # --------------------------------------------------------------------------- #
@@ -545,11 +552,15 @@ def test_data_tab_lists_gaps_missing_days_and_where_the_data_came_from(monkeypat
     data_tab = tab(at, "Data")
 
     assert len(data_tab.dataframe) == 1  # find_gaps; the made-up days have no missing weekday, so no second table
-    gaps = data_tab.dataframe[0].value
+    gaps = data_tab.dataframe[0].value  # what is sent to the browser
     assert list(gaps.index) == HOLDINGS + [BENCHMARK]
     # Readable column names, not find_gaps' internal ones ...
     assert list(gaps.columns) == ["Missing prices", "First missing", "Last missing"]
-    assert gaps["Missing prices"].tolist() == [0] * 7
+    assert gaps["Missing prices"].tolist() == [0] * 7  # counts are numbers (they sort as numbers)
+    assert gaps["First missing"].isna().all() and gaps["Last missing"].isna().all()  # no date: empty, shown as a dash
+    shown = display_values(data_tab.dataframe[0])
+    assert (shown["First missing"] == "—").all() and (shown["Last missing"] == "—").all()  # not None, not NaT
+    assert_sortable_table(data_tab.dataframe[0])
     # ... and a dash instead of "None"/"NaT" where there is no date.
     shown = display_values(data_tab.dataframe[0])
     assert (shown["First missing"] == "—").all() and (shown["Last missing"] == "—").all()
@@ -701,9 +712,14 @@ def test_a_benchmark_with_only_two_prices_is_skipped_with_a_warning(monkeypatch)
 
     table = metrics_table(at)
     assert list(table.index) == ALL_TABLE_ROWS  # the row is still there ...
-    assert table.loc["SPY"].drop(["Daily returns (n)", "Note"]).isna().all()  # ... but empty
+    # ... but empty: no number in the data, and a dash on the page (the placeholder; without it the browser
+    # would draw "None" for an empty number cell)
+    assert table.loc["SPY"].drop(["Daily returns (n)", "Note"]).isna().all()
+    assert (shown_table(at).loc["SPY"].drop(["Daily returns (n)", "Note"]) == "—").all()
+    assert table.loc["SPY", "Daily returns (n)"] == 1  # the real count: 2 prices give 1 return (too few to use)
     assert table.loc["SPY", "Note"] == "skipped (see warning above)"
     assert not table.drop(index="SPY").isna().any().any()  # the Portfolio and the holdings are fine
+    assert_sortable_table(tab(at, "Holdings").dataframe[0], text_columns=["Note"])
     assert kpi_texts(at)["Annualized return"][1] == "SPY: —"  # no benchmark number to show
 
     overview = tab(at, "Overview")
@@ -728,6 +744,8 @@ def test_a_stale_holding_with_one_price_is_skipped_and_the_rest_still_work(monke
     assert any("Stale holding: 'JPM' has no price after 2025-01-01" in m for m in stale)
     table = metrics_table(at)
     assert table.loc["JPM", "Note"] == "skipped (see warning above)"
+    assert table.loc["JPM"].drop(["Daily returns (n)", "Note"]).isna().all()
+    assert (shown_table(at).loc["JPM"].drop(["Daily returns (n)", "Note"]) == "—").all()
     assert not table.drop(index="JPM").isna().any().any()
     assert "JPM" not in chart_tickers(charts(tab(at, "Correlation"))[0])
 
@@ -1045,6 +1063,160 @@ def test_the_about_tab_links_to_the_catch_log_and_the_repository(monkeypatch):
     assert sections.GITHUB_URL == "https://github.com/karakusethem09/signaldesk"
 
 
+def skipped_benchmark(frame):
+    frame.loc[frame.index[:-2], "SPY"] = np.nan  # SPY cannot be calculated: its whole row is empty
+
+
+def stale_holding(frame):
+    frame.loc[frame.index[1:], "JPM"] = np.nan  # JPM stopped trading on day one
+
+
+def gap_in_the_middle(frame):
+    frame.loc[frame.index[100:103], "MSFT"] = np.nan  # also gives find_gaps real dates, not "no date"
+
+
+def short_benchmark(frame):
+    frame.loc[frame.index[:-31], "SPY"] = np.nan  # 30 returns: a flagged row, not an empty one
+
+
+def mixed_magnitudes(frame):
+    """Single-digit and negative returns next to double-digit ones: the case where text and number order differ."""
+    frame["XOM"] = frame["XOM"] * np.linspace(1.0, 0.45, len(frame))
+    frame["JNJ"] = frame["JNJ"] * np.linspace(1.0, 0.8, len(frame))
+
+
+def four_price_benchmark(frame):
+    frame["SPY"] = np.nan
+    frame.iloc[-4:, frame.columns.get_loc("SPY")] = [100.0, 118.0, 227.74, 535.0]  # a GME-like row
+
+
+@pytest.mark.parametrize(
+    "tweak",
+    [None, skipped_benchmark, stale_holding, gap_in_the_middle, short_benchmark, four_price_benchmark],
+    ids=["clean", "skipped-benchmark", "stale-holding", "gap", "short-benchmark", "gme-like-benchmark"],
+)
+def test_every_table_sorts_by_value_and_draws_a_dash_for_an_empty_cell(monkeypatch, tweak):
+    """What a visitor does with a table in the browser, as far as AppTest can see it.
+
+    - Numbers and dates are sent as numbers and dates, so a click on a header sorts by value (a column of
+      texts would sort alphabetically: "5.1%" above "29.3%").
+    - ``placeholder`` is the dash: without it the browser draws "None" for an empty cell and ignores the dash
+      the Styler chose (AppTest reads only the Styler's text, so a test of that text alone would pass).
+    """
+    install_demo(monkeypatch, make_demo(tweak=tweak))
+    at = run_app()
+
+    assert not at.exception
+    tables = [element for tab_ in at.tabs for element in tab_.dataframe]
+    assert len(tables) >= 3  # the weights, the key metrics and the gaps (and the missing days, if there are any)
+    for element in tables:
+        # The missing-days table is texts on purpose (a date and a weekday name); every other table is numbers/dates.
+        text_columns = ["Note"] + ["Date", "Weekday"]
+        assert_sortable_table(element, text_columns=text_columns)
+
+
+@pytest.mark.parametrize("tweak", [skipped_benchmark, mixed_magnitudes], ids=["skipped-benchmark", "mixed-magnitudes"])
+def test_every_non_empty_cell_shows_the_formatted_risk_summary_value_and_an_empty_cell_a_dash(monkeypatch, tweak):
+    demo = install_demo(monkeypatch, make_demo(tweak=tweak))
+    at = run_app()
+    shown = shown_table(at)
+    expected = expected_summary(demo.prices)
+
+    for row in ALL_TABLE_ROWS:
+        for label, column in PERCENT_COLUMNS.items():
+            value = expected.loc[row, column]
+            assert shown.loc[row, label] == ("—" if pd.isna(value) else pct(value)), (row, label)
+        sharpe = expected.loc[row, "sharpe_ratio"]
+        assert shown.loc[row, "Sharpe ratio"] == ("—" if pd.isna(sharpe) else f"{sharpe:.2f}"), row
+        assert shown.loc[row, "Daily returns (n)"] == f"{int(expected.loc[row, 'n_obs']):,}", row
+
+
+def test_every_table_is_drawn_with_the_dash_placeholder(monkeypatch):
+    install_demo(monkeypatch, make_demo(tweak=skipped_benchmark))
+    at = run_app()
+    tables = [element for tab_ in at.tabs for element in tab_.dataframe]
+    # The weights, the key metrics and the gaps. (The made-up days have no missing weekday, so no fourth table.)
+    assert len(tables) == 3 and all(element.proto.placeholder == "—" for element in tables)
+    assert len(at.sidebar.dataframe) == 0  # demo mode: no editor in the sidebar
+
+
+def test_all_four_tables_of_the_real_demo_have_the_placeholder_and_sort_by_value():
+    at = run_app()  # the real snapshot has exchange holidays, so the missing-days table is there too
+    tables = [element for tab_ in at.tabs for element in tab_.dataframe]
+    assert len(tables) == 4
+    for element in tables:
+        assert_sortable_table(element, text_columns=["Note", "Date", "Weekday"])
+
+
+def test_clicking_a_header_would_sort_the_numbers_by_value_not_as_text(monkeypatch):
+    demo = install_demo(monkeypatch, make_demo(tweak=mixed_magnitudes))
+    at = run_app()
+    sent = metrics_table(at)
+    expected = expected_summary(demo.prices)
+
+    for column, field in [("Annualized return", "annualized_return"), ("Max drawdown (loss)", "max_drawdown")]:
+        by_value = sent[column].sort_values(ascending=False).index.tolist()  # what the browser does with numbers
+        assert by_value == expected[field].sort_values(ascending=False).index.tolist(), column
+    # The scenario really is the awkward one: sorted as TEXT the returns would come out in another order,
+    # and a negative number that is closer to zero would rank below a more negative one.
+    shown = shown_table(at)
+    as_text = shown["Annualized return"].sort_values(ascending=False).index.tolist()
+    assert as_text != sent["Annualized return"].sort_values(ascending=False).index.tolist()
+    assert (sent["Annualized return"] < 0).any() and (sent["Annualized return"].abs() < 0.1).any()
+
+
+def test_dates_in_the_gaps_table_sort_chronologically(monkeypatch):
+    def two_gaps(frame):
+        frame.loc[frame.index[200:202], "MSFT"] = np.nan  # later
+        frame.loc[frame.index[10:12], "NVDA"] = np.nan  # earlier, but NVDA comes after MSFT in the table
+
+    install_demo(monkeypatch, make_demo(tweak=two_gaps))
+    at = run_app()
+    gaps = tab(at, "Data").dataframe[0].value
+
+    assert pd.api.types.is_datetime64_any_dtype(gaps["First missing"])  # real dates, not text
+    ordered = gaps["First missing"].sort_values().dropna().index.tolist()
+    assert ordered == ["NVDA", "MSFT"]  # the earlier gap first, whatever the row order of the table
+    assert gaps["Missing prices"].sort_values(ascending=False).iloc[0] == 2 and gaps["Missing prices"].dtype.kind == "i"
+
+
+def test_the_note_column_is_wide_enough_to_read_and_the_numbers_are_right_aligned(monkeypatch):
+    """The reviewer saw "skipped (se" cut off in a real browser."""
+    import json
+
+    install_demo(monkeypatch, make_demo(tweak=skipped_benchmark))
+    columns = json.loads(tab(run_app(), "Holdings").dataframe[0].proto.columns)
+
+    assert columns["Note"]["width"] == "large"
+    for name in ("Annualized return", "Annualized volatility", "Sharpe ratio", "Max drawdown (loss)", "1-day VaR 95% (loss)", "Daily returns (n)"):
+        assert columns[name]["alignment"] == "right", name
+
+
+def test_a_number_that_does_not_exist_is_empty_in_the_data_and_a_dash_on_the_page(monkeypatch):
+    install_demo(monkeypatch, make_demo(tweak=skipped_benchmark))
+    at = run_app()
+    metric_columns = ["Annualized return", "Annualized volatility", "Sharpe ratio", "Max drawdown (loss)", "1-day VaR 95% (loss)"]
+    sent = metrics_table(at)
+    assert sent.loc["SPY", metric_columns].isna().all()  # empty in the data (so it sorts apart from real numbers)
+    assert shown_table(at).loc["SPY", metric_columns].tolist() == ["—"] * 5  # what the Styler says ...
+    assert tab(at, "Holdings").dataframe[0].proto.placeholder == "—"  # ... and what the browser draws for the empty cell
+
+
+def test_every_table_in_the_ui_goes_through_show_table_so_none_forgets_the_placeholder():
+    import re as _re
+
+    from app_helpers import ROOT as _root
+
+    calls = {}
+    for path in sorted((_root / "ui").glob("*.py")) + [_root / "app.py"]:
+        text = path.read_text()
+        for match in _re.finditer(r"st\.(dataframe|data_editor|table)\(", text):
+            calls.setdefault(path.name, []).append(match.group(1))
+    # The one st.dataframe is inside show_table (sections.py); the one st.data_editor is the sidebar's holdings editor.
+    assert calls == {"sections.py": ["dataframe"], "state.py": ["data_editor"]}
+    assert 'st.dataframe(table, placeholder=PLACEHOLDER, **options)' in (_root / "ui" / "sections.py").read_text()
+
+
 # --------------------------------------------------------------------------- #
 # Any failure while loading the demo keeps the page (title, message, footer)
 # --------------------------------------------------------------------------- #
@@ -1109,6 +1281,79 @@ def test_a_bug_in_the_calculation_keeps_the_page(monkeypatch, caplog):
     assert texts(at.error) == ["Something unexpected went wrong while calculating the risk numbers. Please try again."]
     assert at.title[0].value == "SignalDesk" and FOOTER in captions(at)
     assert any("XOM" in str(r.exc_info[1]) for r in caplog.records if r.exc_info)
+
+
+# --------------------------------------------------------------------------- #
+# A bug while DRAWING keeps the rest of the page (title, key numbers, other tabs, footer)
+# --------------------------------------------------------------------------- #
+
+def test_a_bug_in_the_metrics_table_leaves_the_rest_of_the_page_alone(monkeypatch, caplog):
+    install_demo(monkeypatch, make_demo())
+
+    def broken(summary):
+        raise KeyError("Note")
+
+    monkeypatch.setattr(sections, "metrics_for_display", broken)
+    with caplog.at_level("ERROR"):
+        at = run_app()
+
+    assert not at.exception  # no generic Streamlit error box
+    assert at.title[0].value == "SignalDesk"
+    assert len(at.metric) == 5  # the key numbers are still there
+    assert FOOTER in captions(at)
+    assert texts(tab(at, "Holdings").error) == [
+        "Something unexpected went wrong while drawing the metrics table. The rest of the page is not affected."
+    ]
+    assert len(tab(at, "Holdings").dataframe) == 0
+    assert len(charts(at)) == 4  # growth, drawdown, rolling volatility and the heatmap are all drawn
+    assert len(tab(at, "Data").dataframe) == 1 and tab(at, "About").subheader  # the Data and About tabs too
+    assert any("Note" in str(r.exc_info[1]) for r in caplog.records if r.exc_info)  # the cause is in the log
+
+
+def test_a_bug_in_one_chart_leaves_the_other_tabs_alone(monkeypatch):
+    install_demo(monkeypatch, make_demo())
+
+    def broken(*args, **kwargs):
+        raise TypeError("a chart bug")
+
+    monkeypatch.setattr(sections, "correlation_chart", broken)
+    at = run_app()
+
+    assert not at.exception
+    assert len(texts(tab(at, "Correlation").error)) == 1 and "correlation chart" in tab(at, "Correlation").error[0].value
+    assert len(charts(tab(at, "Overview"))) == 1 and len(charts(tab(at, "Risk"))) == 2
+    assert len(tab(at, "Holdings").dataframe) == 1 and len(at.metric) == 5 and FOOTER in captions(at)
+
+
+def test_a_bug_in_the_key_numbers_leaves_the_tabs_alone(monkeypatch):
+    install_demo(monkeypatch, make_demo())
+    monkeypatch.setattr(sections, "render_kpis", lambda *args: (_ for _ in ()).throw(ValueError("kpi bug")))
+    at = run_app()
+
+    assert not at.exception
+    assert len(at.metric) == 0
+    assert any("key numbers" in message for message in texts(at.error))
+    assert len(charts(at)) == 4 and FOOTER in captions(at)
+
+
+def test_anything_else_that_breaks_the_page_still_gets_a_message_and_the_footer(monkeypatch, caplog):
+    install_demo(monkeypatch, make_demo())
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the page code blew up")
+
+    monkeypatch.setattr(sections, "render_title", broken)  # drawn by render_page itself, outside the per-part guards
+    with caplog.at_level("ERROR"):
+        at = run_app()
+
+    assert not at.exception
+    assert texts(at.error) == [
+        "Something unexpected went wrong while drawing this page. Please reload it, or try again in a moment."
+    ]
+    assert FOOTER in captions(at)
+    assert "blew up" not in at.error[0].value  # internals stay in the log
+    assert any("blew up" in str(r.exc_info[1]) for r in caplog.records if r.exc_info)
+    assert len(at.button) == 0  # demo mode: nothing to go back to
 
 
 # --------------------------------------------------------------------------- #

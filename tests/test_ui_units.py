@@ -43,16 +43,29 @@ def test_every_test_in_this_file_runs_with_the_network_guard_on(request):
 
 def test_the_offline_guard_covers_this_file_too(offline):
     """If the guard did nothing, "these tests never touch the network" would prove nothing."""
+    import os
     import socket
+
+    from curl_cffi import aio as curl_aio
+    from curl_cffi import requests as curl_requests
 
     with pytest.raises(AssertionError, match="Python socket"):
         socket.create_connection(("127.0.0.1", 1), timeout=1)
-    from curl_cffi import requests as curl_requests
-
     with pytest.raises(AssertionError, match="libcurl"):
         curl_requests.get("http://127.0.0.1:1/", timeout=3)  # nothing listens there either way
-    assert [kind for kind, _ in offline] == ["socket", "curl"]
+    with pytest.raises(AssertionError, match="async libcurl"):  # the third way out, which the first version of this guard missed
+        curl_aio.AsyncCurl.add_handle(object())
+    assert [kind for kind, _ in offline] == ["socket", "curl", "curl-async"]
+    assert os.environ.get("NO_PROXY") == "*" and os.environ.get("no_proxy") == "*"  # no proxy can take a request
     offline.clear()  # expected: do not let the fixture's final check fail this test
+
+
+def test_the_ui_guard_is_the_data_tests_guard_not_a_copy():
+    import conftest
+    import test_data
+
+    assert conftest.network_guard is test_data.network_guard
+    assert conftest.real_yf is test_data.real_yf
 
 
 # --------------------------------------------------------------------------- #
@@ -863,6 +876,39 @@ def test_a_busy_gate_spends_neither_budget(monkeypatch):
     assert rig.loader.calls == []
     assert rig.limiter.remaining("v1") == 2 and rig.limiter.key_count == 0
     assert rig.site_remaining() == 30 and rig.site_limiter.key_count == 0
+
+
+class GateThatMustNotBeUsed:
+    """A gate that fails the test if anybody even asks for a slot (waiting for it could take 20 seconds)."""
+
+    def slot(self, timeout=5.0):
+        raise AssertionError("the visitor waited for the download gate although the limit was already used up")
+
+
+def test_a_full_site_is_refused_at_once_without_waiting_for_the_gate(monkeypatch):
+    rig = Rig(monkeypatch, budget=10, site_budget=1)
+    rig.load(new_request(1), visitor="alice")  # the site's one load is spent
+    rig.gate = GateThatMustNotBeUsed()
+    with pytest.raises(live.SiteRateLimited):  # an immediate refusal: no slot was asked for
+        rig.load(new_request(2), visitor="bob")
+
+
+def test_a_visitor_who_is_out_of_budget_is_refused_at_once_without_waiting_for_the_gate(monkeypatch):
+    rig = Rig(monkeypatch, budget=1, site_budget=30)
+    rig.load(new_request(1), visitor="alice")
+    rig.gate = GateThatMustNotBeUsed()
+    with pytest.raises(live.RateLimited) as caught:
+        rig.load(new_request(2), visitor="alice")
+    assert not isinstance(caught.value, live.SiteRateLimited)
+
+
+def test_a_busy_gate_does_not_hide_the_limit_message(monkeypatch):
+    """With another download running, a visitor who is over a limit sees the LIMIT message, not "busy"."""
+    rig = Rig(monkeypatch, budget=1, site_budget=30, concurrent=1)
+    rig.load(new_request(1), visitor="alice")
+    with rig.gate.slot(timeout=1):  # somebody else's download is running
+        with pytest.raises(live.RateLimited):  # not LimitError("busy")
+            rig.load(new_request(2), visitor="alice", gate_timeout=0.05)
 
 
 def test_the_site_budget_comes_back_after_the_hour(monkeypatch):
